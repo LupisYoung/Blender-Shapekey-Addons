@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Shapekey Add-Ons",
     "author": "LupisYoung",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "Object Data Properties > Shape Keys",
     "description": "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys.",
@@ -12,8 +12,14 @@ bl_info = {
     "category": "Object",
 }
 
+__version__ = ".".join(map(str, bl_info.get("version", (0, 0, 0))))
+
 import bpy
-from bpy.types import Operator, Panel, PropertyGroup, UIList
+import json
+import urllib.request
+import urllib.error
+from bpy.types import Operator, Panel, PropertyGroup, UIList, AddonPreferences
+import re
 from bpy.props import (
     BoolProperty,
     StringProperty,
@@ -27,18 +33,204 @@ from bpy.props import (
 # Helpers & state
 # =====================================================
 
+GITHUB_REPO = "LupisYoung/Blender-Shapekey-Addons"
+GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+
+_ADDON_ID = __package__ or __name__.split(".", 1)[0]
+
+def _current_version_tuple():
+    """
+    Returns (major, minor, patch) from, in order:
+    - this module's bl_info['version']
+    - this module's __version__ string
+    - Blender's registered add-on module bl_info['version'] or __version__
+    - fallback (0, 0, 0)
+    """
+    import sys
+    import bpy
+
+    mod = sys.modules.get(__name__)
+    if mod:
+        try:
+            vi = getattr(mod, "bl_info", {}).get("version", None)
+            if isinstance(vi, (tuple, list)) and len(vi) >= 1:
+                a = list(vi[:3]) + [0, 0]
+                return tuple(int(x) for x in a[:3])
+        except Exception:
+            pass
+        try:
+            vstr = getattr(mod, "__version__", "")
+            if isinstance(vstr, str) and vstr:
+                parts = vstr.split(".")
+                nums = []
+                for p in parts[:3]:
+                    try:
+                        nums.append(int(p))
+                    except Exception:
+                        nums.append(0)
+                while len(nums) < 3:
+                    nums.append(0)
+                return tuple(nums)
+        except Exception:
+            pass
+
+    try:
+        addon_id = __package__ or __name__.split(".", 1)[0]
+        entry = bpy.context.preferences.addons.get(addon_id)
+        reg_mod = getattr(entry, "module", None) if entry else None
+        if reg_mod:
+            vi = getattr(reg_mod, "bl_info", {}).get("version", None)
+            if isinstance(vi, (tuple, list)) and len(vi) >= 1:
+                a = list(vi[:3]) + [0, 0]
+                return tuple(int(x) for x in a[:3])
+            vstr = getattr(reg_mod, "__version__", "")
+            if isinstance(vstr, str) and vstr:
+                parts = vstr.split(".")
+                nums = []
+                for p in parts[:3]:
+                    try:
+                        nums.append(int(p))
+                    except Exception:
+                        nums.append(0)
+                while len(nums) < 3:
+                    nums.append(0)
+                return tuple(nums)
+    except Exception:
+        pass
+
+    return (0, 0, 0)
+    if isinstance(vi, str):
+        parts = vi.split(".")[:3]
+        out = []
+        for p in parts:
+            try:
+                out.append(int(p))
+            except ValueError:
+                out.append(0)
+        while len(out) < 3:
+            out.append(0)
+        return tuple(out)
+    return (0, 0, 0)
+
+
+def _parse_version_tag(tag: str):
+    """Parse 'v1.2.3' or '1.2.3' into (1,2,3). Unknown/missing -> (0,0,0)."""
+    if not tag:
+        return (0, 0, 0)
+    t = tag[1:] if tag[:1] in ("v", "V") else tag
+    parts = t.strip().split(".")[:3]
+    out = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _fetch_latest_tag():
+    """Return latest release tag_name from GitHub Releases API, or '' on failure."""
+    ua = "Blender-Shapekey-Add-Ons/{}".format(".".join(map(str, _current_version_tuple())) or "0.0.0")
+    req = urllib.request.Request(GITHUB_LATEST_API, headers={"User-Agent": ua})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        return data.get("tag_name") or ""
+    except urllib.error.HTTPError as e:
+        return ""
+    except Exception:
+        return ""
+
+
+class SKO_OT_CheckUpdates(Operator):
+    bl_idname = "shapekey_organizer.check_updates"
+    bl_label = "Check for Updates"
+    bl_description = "Check GitHub for a newer version of this add-on"
+    bl_options = {'INTERNAL'}
+
+    silent_if_latest: bpy.props.BoolProperty(
+        name="Silent If Latest",
+        description="If enabled, do not show a popup unless a newer version is available",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    def execute(self, context):
+        current = _current_version_tuple()
+        latest_tag = _fetch_latest_tag()
+        latest = _parse_version_tag(latest_tag)
+
+        if latest > current:
+            msg = f"New version available: {latest_tag or 'unknown'} (current {'.'.join(map(str, current))})."
+            self._popup(context, msg, show_open=True)
+        else:
+            if not self.silent_if_latest:
+                if latest_tag == "":
+                    self._popup(context, "Could not determine latest version (GitHub API unavailable).", show_open=True)
+                else:
+                    self._popup(context, "You are on the latest version.", show_open=False)
+        return {'FINISHED'}
+
+    def _popup(self, context, message, show_open=True):
+        def draw(self, _ctx):
+            self.layout.label(text=message)
+            if show_open:
+                self.layout.operator("wm.url_open", text="Open Releases").url = GITHUB_RELEASES_URL
+        context.window_manager.popup_menu(draw, title="Blender Shapekey Add-Ons - Update", icon='INFO')
+
+
+class SKO_AddonPreferences(AddonPreferences):
+    bl_idname = _ADDON_ID
+
+    auto_check: BoolProperty(
+        name="Check on Startup",
+        description="Check GitHub for updates once after loading a file",
+        default=False,
+    )
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(self, "auto_check")
+        row.operator("shapekey_organizer.check_updates", icon='FILE_REFRESH')
+
+
+def _sko_auto_check(_dummy):
+    try:
+        entry = bpy.context.preferences.addons.get(_ADDON_ID)
+        prefs = getattr(entry, "preferences", None)
+        if getattr(prefs, "auto_check", False):
+            try:
+                bpy.ops.shapekey_organizer.check_updates('INVOKE_DEFAULT', silent_if_latest=True)
+            except Exception:
+                pass
+    finally:
+        try:
+            bpy.app.handlers.load_post.remove(_sko_auto_check)
+        except Exception:
+            pass
+
+
+
 def _on_find_change(self, context):
-    """When the Find field changes, auto-select all keys whose names contain it (case-insensitive).
-    (Does not deselect others; empty Find does nothing.)"""
+    """When the Find field changes, auto-select keys whose names contain it.
+    Respects the case sensitivity toggle (default: case-insensitive)."""
     try:
         obj = active_obj_mesh(context)
         if not obj:
             return
-        txt = self.find.lower()
-        if not txt:
+        needle = self.find
+        if not needle:
             return
+        case_sensitive = getattr(self, 'find_case_sensitive', False)
+        if not case_sensitive:
+            needle_cmp = needle.lower()
         for k in iter_keyblocks(obj):
-            if txt in k.name.lower():
+            hay = k.name if case_sensitive else k.name.lower()
+            if (needle if case_sensitive else needle_cmp) in hay:
                 set_sel(k, True)
     except Exception:
         pass
@@ -204,9 +396,14 @@ class SKO_Props(PropertyGroup):
     )
     find: StringProperty(
         name="Find",
-        description="Auto-selects keys whose names contain this text; used by Find & Replace (case-insensitive)",
+        description="Auto-selects keys whose names contain this text; used by Find & Replace",
         default="",
         update=_on_find_change,
+    )
+    find_case_sensitive: BoolProperty(
+        name="Case Sensitive",
+        description="Treat Find & Replace as case-sensitive (off = case-insensitive)",
+        default=False,
     )
     replace: StringProperty(
         name="Replace",
@@ -236,12 +433,16 @@ class SKO_Props(PropertyGroup):
     slider_min: FloatProperty(
         name="Slider Min",
         description="Set slider minimum for (visible) selected keys",
-        default=0.0
+        default=0.0,
+        min=0.0, max=1.0,
+        soft_min=0.0, soft_max=1.0,
     )
     slider_max: FloatProperty(
         name="Slider Max",
         description="Set slider maximum for (visible) selected keys",
-        default=1.0
+        default=1.0,
+        min=0.0, max=1.0,
+        soft_min=0.0, soft_max=1.0,
     )
     affect_only_selected: BoolProperty(
         name="Only Selected",
@@ -515,7 +716,7 @@ class SKO_OT_PrefixSuffix(Operator):
 class SKO_OT_FindReplace(Operator):
     bl_idname = "shapekey_organizer.find_replace"
     bl_label = "Find & Replace"
-    bl_description = "Find text in names and replace it for each affected shapekey"
+    bl_description = "Find text in names and replace it for each affected shapekey (case-insensitive by default)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -529,16 +730,31 @@ class SKO_OT_FindReplace(Operator):
         if not find:
             self.report({'WARNING'}, "Enter text to find.")
             return {'CANCELLED'}
+
+        case_sensitive = props.find_case_sensitive
         count = 0
-        for k in iter_keyblocks(obj):
-            if props.affect_only_selected and not get_sel(k):
-                continue
-            if find.lower() in k.name.lower():
-                it = ensure_item_by_name(k.name, create=True)
-                new_name = k.name.replace(find, repl)
-                k.name = new_name
-                it.key_name = new_name
-                count += 1
+        if case_sensitive:
+            for k in iter_keyblocks(obj):
+                if props.affect_only_selected and not get_sel(k):
+                    continue
+                if find in k.name:
+                    it = ensure_item_by_name(k.name, create=True)
+                    new_name = k.name.replace(find, repl)
+                    k.name = new_name
+                    it.key_name = new_name
+                    count += 1
+        else:
+            pattern = re.compile(re.escape(find), re.IGNORECASE)
+            for k in iter_keyblocks(obj):
+                if props.affect_only_selected and not get_sel(k):
+                    continue
+                if pattern.search(k.name):
+                    it = ensure_item_by_name(k.name, create=True)
+                    new_name = pattern.sub(repl, k.name)
+                    k.name = new_name
+                    it.key_name = new_name
+                    count += 1
+
         self.report({'INFO'}, f"Renamed {count} keys.")
         return {'FINISHED'}
 
@@ -729,12 +945,44 @@ class SKO_OT_SetSliderRange(Operator):
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
         props = context.scene.shapekey_organizer
+
+        min_v = max(0.0, min(1.0, float(props.slider_min)))
+        max_v = max(0.0, min(1.0, float(props.slider_max)))
+
+        if min_v > max_v:
+            min_v, max_v = max_v, min_v
+
+        if abs(max_v - min_v) < 1e-9:
+            eps = 1e-4
+            if min_v <= 0.0:
+                max_v = min(min_v + eps, 1.0)
+            elif max_v >= 1.0:
+                min_v = max(max_v - eps, 0.0)
+            else:
+                half = eps * 0.5
+                min_v = max(0.0, min_v - half)
+                max_v = min(1.0, max_v + half)
+
+        visible = filtered_keys(context, obj)
+        targets = [k for k in visible if get_sel(k)] if props.affect_only_selected else list(visible)
+        if not targets:
+            self.report({'INFO'}, "No visible shapekeys to update.")
+            return {'CANCELLED'}
+
         count = 0
-        for k in iter_keyblocks(obj):
-            if props.affect_only_selected and not get_sel(k):
+        for k in targets:
+            try:
+                k.slider_min = min_v
+                k.slider_max = max_v
+            except Exception:
                 continue
-            k.slider_min = props.slider_min
-            k.slider_max = props.slider_max
+            try:
+                if k.value < min_v:
+                    k.value = min_v
+                elif k.value > max_v:
+                    k.value = max_v
+            except Exception:
+                pass
             count += 1
         self.report({'INFO'}, f"Updated slider ranges on {count} keys.")
         return {'FINISHED'}
@@ -743,7 +991,7 @@ class SKO_OT_SetSliderRange(Operator):
 class SKO_OT_ResetValues(Operator):
     bl_idname = "shapekey_organizer.reset_values"
     bl_label = "Reset Values to 0"
-    bl_description = "Set value to 0.0 for affected shapekeys"
+    bl_description = "Reset slider range and set value = 0.0 for affected shapekeys"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -752,13 +1000,45 @@ class SKO_OT_ResetValues(Operator):
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
         props = context.scene.shapekey_organizer
-        count = 0
-        for k in iter_keyblocks(obj):
-            if props.affect_only_selected and not get_sel(k):
+
+        visible = filtered_keys(context, obj)
+        targets = [k for k in visible if get_sel(k)] if props.affect_only_selected else list(visible)
+        if not targets:
+            self.report({'INFO'}, "No visible shapekeys to reset.")
+            return {'CANCELLED'}
+
+        default_min, default_max = 0.0, 1.0
+        ranges_reset = 0
+        values_reset = 0
+
+        for k in targets:
+            try:
+                k.slider_min = default_min
+                k.slider_max = default_max
+                ranges_reset += 1
+            except Exception:
+                pass
+
+            if is_basis_key(obj, k):
                 continue
-            k.value = 0.0
-            count += 1
-        self.report({'INFO'}, f"Reset {count} keys to 0.0")
+            try:
+                k.value = 0.0
+                values_reset += 1
+            except Exception:
+                pass
+
+        props.slider_min = 0.0
+        props.slider_max = 1.0
+
+        try:
+            for win in bpy.context.window_manager.windows:
+                for area in win.screen.areas:
+                    if area.type == 'PROPERTIES':
+                        area.tag_redraw()
+        except Exception:
+            pass
+
+        self.report({'INFO'}, f"Reset ranges on {ranges_reset} keys and values on {values_reset} keys.")
         return {'FINISHED'}
 
 
@@ -1003,12 +1283,22 @@ class SKO_PT_Main(Panel):
         if props.show_rename:
             row = rn.row(align=True)
             row.prop(props, 'prefix')
+            row.separator()
             row.prop(props, 'suffix')
             rn.operator("shapekey_organizer.add_prefix_suffix")
+
+            rn.separator()
+
             row = rn.row(align=True)
             row.prop(props, 'find')
+            row.separator()
             row.prop(props, 'replace')
             rn.operator("shapekey_organizer.find_replace")
+            row = rn.row(align=True)
+            row.prop(props, 'find_case_sensitive', text='Case-Sensitive')
+
+            rn.separator()
+
             row = rn.row(align=True)
             row.prop(props, 'auto_number_start')
             row.prop(props, 'auto_number_pad')
@@ -1043,8 +1333,10 @@ classes = (
     SKO_Item,
     SKO_GroupItem,
     SKO_Props,
+    SKO_AddonPreferences,
     SKO_UL_ShapeKeys,
     SKO_UL_Groups,
+    SKO_OT_CheckUpdates,
     SKO_OT_ToggleSelect,
     SKO_OT_SelectAll,
     SKO_OT_SelectNone,
@@ -1078,8 +1370,17 @@ def register():
     bpy.types.Scene.sko_groups = CollectionProperty(type=SKO_GroupItem)
     bpy.types.Scene.sko_groups_index = IntProperty(default=-1)
 
+    if _sko_auto_check not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_sko_auto_check)
+
 
 def unregister():
+    try:
+        if _sko_auto_check in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(_sko_auto_check)
+    except Exception:
+        pass
+
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
     del bpy.types.Scene.shapekey_organizer

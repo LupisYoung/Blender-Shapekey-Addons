@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "blender_shapekey_addons"
 
-version = "1.1.0"
+version = "1.2.0"
 
 name = "Blender Shapekey Add-Ons"
 
@@ -19,3 +19,6 @@ tags = ["Mesh", "Object", "User Interface"]
 blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Check GitHub for latest release"
