@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Shapekey Add-Ons",
     "author": "LupisYoung",
-    "version": (1, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "Object Data Properties > Shape Keys",
     "description": "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys.",
@@ -60,6 +60,10 @@ class SKO_Item(PropertyGroup):
     group: StringProperty(name="Group", description="Optional group tag for this shapekey")
 
 
+class SKO_GroupItem(PropertyGroup):
+    name: StringProperty(name="Group Name", description="Custom group tag")
+
+
 def _state_items():
     scn = bpy.context.scene
     return getattr(scn, 'sko_items', None)
@@ -110,6 +114,23 @@ def set_group(key, group_name: str):
         it.group = group_name or ""
 
 
+def all_groups(context):
+    return getattr(context.scene, 'sko_groups', [])
+
+
+def ensure_group(context, name: str):
+    name = (name or "").strip()
+    if not name:
+        return None
+    groups = all_groups(context)
+    for g in groups:
+        if g.name == name:
+            return g
+    g = groups.add()
+    g.name = name
+    return g
+
+
 def filtered_keys(context, obj):
     ks = iter_keyblocks(obj)
     if not ks:
@@ -125,6 +146,11 @@ def filtered_keys(context, obj):
             continue
         out.append(k)
     return out
+
+
+def is_basis_key(obj, key):
+    ks = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+    return bool(ks) and key == ks[0]
 
 
 def _ensure_active_not_basis(obj):
@@ -158,6 +184,13 @@ class SKO_Props(PropertyGroup):
         name="Group",
         description="Show only keys assigned to this exact group tag",
         default="",
+        options={'HIDDEN'}
+    )
+    anchor_index: IntProperty(
+        name="Selection Anchor Index",
+        description="Internal: start index for Shift-click range selection",
+        default=-1,
+        options={'HIDDEN'}
     )
     prefix: StringProperty(
         name="Prefix",
@@ -171,7 +204,7 @@ class SKO_Props(PropertyGroup):
     )
     find: StringProperty(
         name="Find",
-        description="Auto-selects keys whose names contain this text; used by Find & Replace (case-sensitive)",
+        description="Auto-selects keys whose names contain this text; used by Find & Replace (case-insensitive)",
         default="",
         update=_on_find_change,
     )
@@ -186,8 +219,7 @@ class SKO_Props(PropertyGroup):
         items=[
             ('NAME_ASC', "Name A→Z", "Sort by name ascending"),
             ('NAME_DESC', "Name Z→A", "Sort by name descending"),
-            ('GROUP_NAME', "Group→Name", "Group (A→Z), then Name (A→Z)"),
-            ('PINNED_FIRST', "Pinned First", "Pinned keys first, then A→Z"),
+            ('GROUP_LIST', "Group List → Name", "Follow custom group list order, then Name A→Z"),
         ],
         default='NAME_ASC'
     )
@@ -211,15 +243,20 @@ class SKO_Props(PropertyGroup):
         description="Set slider maximum for (visible) selected keys",
         default=1.0
     )
-    list_rows: IntProperty(
-        name="Rows",
-        description="Number of rows to display in the scrollable list",
-        default=10, min=3, max=24
-    )
     affect_only_selected: BoolProperty(
         name="Only Selected",
         description="If enabled, actions only affect keys with the checkbox enabled. If off, actions affect all visible keys",
         default=True
+    )
+    group_search: StringProperty(
+        name="Group",
+        description="Group name to add/select/filter",
+        default="",
+    )
+    group_active_index: IntProperty(
+        name="Active Group Index",
+        default=-1,
+        options={'HIDDEN'}
     )
 
     # UI foldouts
@@ -241,14 +278,16 @@ class SKO_UL_ShapeKeys(UIList):
         sel = get_sel(key)
         row = layout.row(align=True)
         row.prop(key, 'name', text="", emboss=True)
-        row.prop(key, 'value', text="")
-        row.prop(key, 'mute', text="", icon_only=True, icon='HIDE_OFF')
-        row.prop(key, 'pin', text="", icon_only=True, icon='PINNED')
-        op = row.operator("shapekey_organizer.toggle_select", text="", icon='CHECKBOX_HLT' if sel else 'CHECKBOX_DEHLT', depress=sel)
-        op.key_name = key.name
+
         g = get_group(key)
         if g:
-            row.label(text=f"[{g}]")
+            tag = row.row(align=True)
+            tag.label(text=g, icon='GROUP')
+
+        row.prop(key, 'value', text="")
+        row.prop(key, 'mute', text="", icon_only=True, icon='HIDE_OFF')
+        op = row.operator("shapekey_organizer.toggle_select", text="", icon='CHECKBOX_HLT' if sel else 'CHECKBOX_DEHLT', depress=sel)
+        op.key_name = key.name
 
     def filter_items(self, context, data, propname):
         try:
@@ -269,6 +308,17 @@ class SKO_UL_ShapeKeys(UIList):
             flt_flags.append(self.bitflag_filter_item if show else 0)
         return flt_flags, list(range(len(flt_flags)))
 
+
+
+class SKO_UL_Groups(UIList):
+    bl_idname = "SKO_UL_groups"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if not item:
+            return
+        row = layout.row(align=True)
+        row.label(text=item.name)
+
 # =====================================================
 # Operators
 # =====================================================
@@ -276,17 +326,45 @@ class SKO_UL_ShapeKeys(UIList):
 class SKO_OT_ToggleSelect(Operator):
     bl_idname = "shapekey_organizer.toggle_select"
     bl_label = "Toggle Select"
-    bl_description = "Toggle selection state for this shapekey"
+    bl_description = "Click to toggle; Shift-click to select a range between the anchor and this item"
     bl_options = {'INTERNAL', 'UNDO'}
 
     key_name: StringProperty(name="Key Name")
+    range_mode: BoolProperty(options={'HIDDEN'}, default=False)
+
+    def invoke(self, context, event):
+        self.range_mode = bool(getattr(event, "shift", False))
+        return self.execute(context)
 
     def execute(self, context):
-        it = ensure_item_by_name(self.key_name, create=True)
-        if not it:
-            self.report({'WARNING'}, "Could not access selection state.")
+        obj = context.object
+        if not obj or obj.type != 'MESH':
+            self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
-        it.selected = not it.selected
+
+        ks = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+        if not ks:
+            return {'CANCELLED'}
+
+        props = context.scene.shapekey_organizer
+
+        idx_of = {k.name: i for i, k in enumerate(ks)}
+        if self.key_name not in idx_of:
+            return {'CANCELLED'}
+        current_idx = idx_of[self.key_name]
+
+        visible_names = [k.name for k in filtered_keys(context, obj)]
+        visible_set = {idx_of[n] for n in visible_names if n in idx_of}
+
+        if self.range_mode and props.anchor_index >= 0 and props.anchor_index in visible_set and current_idx in visible_set:
+            a, b = sorted((props.anchor_index, current_idx))
+            for i in range(a, b + 1):
+                if i in visible_set:
+                    set_sel(ks[i], True)
+        else:
+            set_sel(ks[current_idx], not get_sel(ks[current_idx]))
+
+        props.anchor_index = current_idx
         return {'FINISHED'}
 
 
@@ -314,7 +392,7 @@ class SKO_OT_SyncState(Operator):
 class SKO_OT_SelectAll(Operator):
     bl_idname = "shapekey_organizer.select_all"
     bl_label = "All"
-    bl_description = "Select all currently visible (filtered) shapekeys"
+    bl_description = "Select all currently visible (filtered) shapekeys (ignores Basis)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -323,6 +401,8 @@ class SKO_OT_SelectAll(Operator):
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
         for k in filtered_keys(context, obj):
+            if is_basis_key(obj, k):
+                continue
             set_sel(k, True)
         return {'FINISHED'}
 
@@ -346,7 +426,7 @@ class SKO_OT_SelectNone(Operator):
 class SKO_OT_SelectInvert(Operator):
     bl_idname = "shapekey_organizer.select_invert"
     bl_label = "Invert"
-    bl_description = "Invert selection for all currently visible (filtered) shapekeys"
+    bl_description = "Invert selection for all currently visible (filtered) shapekeys (ignores Basis)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -355,6 +435,8 @@ class SKO_OT_SelectInvert(Operator):
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
         for k in filtered_keys(context, obj):
+            if is_basis_key(obj, k):
+                continue
             set_sel(k, not get_sel(k))
         return {'FINISHED'}
 
@@ -362,7 +444,7 @@ class SKO_OT_SelectInvert(Operator):
 class SKO_OT_AssignGroup(Operator):
     bl_idname = "shapekey_organizer.assign_group"
     bl_label = "Assign Group"
-    bl_description = "Assign the current Group filter value to selected shapekeys"
+    bl_description = "Assign the current Group field value to selected shapekeys"
     bl_options = {'REGISTER', 'UNDO'}
 
     group: StringProperty(name="Group", description="Group name to assign to selected keys")
@@ -451,7 +533,7 @@ class SKO_OT_FindReplace(Operator):
         for k in iter_keyblocks(obj):
             if props.affect_only_selected and not get_sel(k):
                 continue
-            if find in k.name:
+            if find.lower() in k.name.lower():
                 it = ensure_item_by_name(k.name, create=True)
                 new_name = k.name.replace(find, repl)
                 k.name = new_name
@@ -492,47 +574,72 @@ class SKO_OT_AutoNumber(Operator):
 class SKO_OT_Sort(Operator):
     bl_idname = "shapekey_organizer.sort"
     bl_label = "Sort Selected"
-    bl_description = "Sort the selected (or all visible) keys based on the chosen mode. Basis is kept at the top"
+    bl_description = ("Sort visible keys (or only selected if enabled). "
+                      "Modes: A→Z (All), Z→A (All), or Group List → Name (ungrouped last). "
+                      "Basis stays at the top.")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        obj = active_obj_mesh(context)
-        if not obj:
+        obj = context.object
+        if not obj or obj.type != 'MESH':
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
-        ks = iter_keyblocks(obj)
+
+        ks = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
         if not ks:
+            self.report({'INFO'}, "No shapekeys found.")
             return {'CANCELLED'}
+
         props = context.scene.shapekey_organizer
 
-        data = [(i, k) for i, k in enumerate(ks) if (not props.affect_only_selected or get_sel(k))]
-        if not data:
-            self.report({'INFO'}, "Nothing to sort.")
+        visible = filtered_keys(context, obj)
+
+        targets = [k for k in visible if get_sel(k)] if props.affect_only_selected else list(visible)
+        if not targets:
+            self.report({'INFO'}, "Nothing to sort (check filters/selection).")
             return {'CANCELLED'}
 
-        def sort_key(item):
-            _, k = item
-            if props.sort_mode == 'NAME_DESC':
-                return (k.name.lower(),)
-            if props.sort_mode == 'GROUP_NAME':
-                return (get_group(k).lower(), k.name.lower())
-            if props.sort_mode == 'PINNED_FIRST':
-                return (0 if k.pin else 1, k.name.lower())
-            return (k.name.lower(),)
+        mode = props.sort_mode
 
-        reverse = True if props.sort_mode == 'NAME_DESC' else False
-        ordered = sorted(data, key=sort_key, reverse=reverse)
+        if mode in {'NAME_ASC', 'NAME_DESC'}:
+            reverse = (mode == 'NAME_DESC')
+            ordered = sorted(targets, key=lambda k: k.name.lower(), reverse=reverse)
+            order_name = "Name A→Z" if not reverse else "Name Z→A"
+        else:
+            glist = [g.name for g in all_groups(context)]
+            gprio = {name: i for i, name in enumerate(glist)}
+
+            def sort_key(k):
+                gname = get_group(k)
+                gindex = gprio.get(gname, 999999)  # ungrouped last
+                return (gindex, k.name.lower())
+
+            ordered = sorted(targets, key=sort_key)
+            order_name = "Group List → Name"
+
+        def index_of(name: str) -> int:
+            for i, kb in enumerate(obj.data.shape_keys.key_blocks):
+                if kb.name == name:
+                    return i
+            return -1
 
         try:
             bpy.ops.object.mode_set(mode='OBJECT')
         except Exception:
             pass
-        indices = [idx for idx, _ in ordered]
-        for idx in sorted(indices):
-            obj.active_shape_key_index = idx
-            move_active_to_top_below_basis(obj)
-        self.report({'INFO'}, f"Sorted {len(indices)} keys (moved below Basis).")
+
+        for k in reversed(ordered):
+            i = index_of(k.name)
+            if i < 0:
+                continue
+            obj.active_shape_key_index = i
+            bpy.ops.object.shape_key_move(type='TOP')
+            while obj.active_shape_key_index == 0:
+                bpy.ops.object.shape_key_move(type='DOWN')
+
+        self.report({'INFO'}, f"Sorted {len(ordered)} keys: {order_name}.")
         return {'FINISHED'}
+
 
 
 class SKO_OT_MoveSelected(Operator):
@@ -654,6 +761,160 @@ class SKO_OT_ResetValues(Operator):
         self.report({'INFO'}, f"Reset {count} keys to 0.0")
         return {'FINISHED'}
 
+
+class SKO_OT_GroupAdd(Operator):
+    bl_idname = "shapekey_organizer.group_add"
+    bl_label = "Add"
+    bl_description = (
+        "Add the typed group name to the Groups list (no duplicates) and assign it to currently selected shapekeys. "
+        "If the group already exists, it becomes the active selection."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scn = context.scene
+        props = scn.shapekey_organizer
+        name = props.group_search.strip()
+        if not name:
+            self.report({'WARNING'}, "Enter a group name to add.")
+            return {'CANCELLED'}
+
+        groups = scn.sko_groups
+        existed = any(g.name == name for g in groups)
+        ensure_group(context, name)
+
+        for i, g in enumerate(groups):
+            if g.name == name:
+                scn.sko_groups_index = i
+                break
+
+        obj = active_obj_mesh(context)
+        assigned = 0
+        if obj:
+            for k in iter_keyblocks(obj):
+                if is_basis_key(obj, k):
+                    continue
+                if get_sel(k):
+                    set_group(k, name)
+                    assigned += 1
+
+        for area in context.screen.areas:
+            if area.type == 'PROPERTIES':
+                area.tag_redraw()
+
+        if existed:
+            self.report({'INFO'}, f"Selected existing group '{name}'. Assigned to {assigned} keys.")
+        else:
+            self.report({'INFO'}, f"Added group '{name}'. Assigned to {assigned} keys.")
+        return {'FINISHED'}
+
+
+class SKO_OT_GroupRemove(Operator):
+    bl_idname = "shapekey_organizer.group_remove"
+    bl_label = "Remove"
+    bl_description = "Remove the selected group from the list and clear it from all assigned shapekeys"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scn = context.scene
+        idx = scn.sko_groups_index
+        groups = scn.sko_groups
+        if idx < 0 or idx >= len(groups):
+            return {'CANCELLED'}
+
+        group_name = groups[idx].name
+
+        obj = active_obj_mesh(context)
+        removed_count = 0
+        if obj:
+            for k in iter_keyblocks(obj):
+                if get_group(k) == group_name:
+                    set_group(k, "")
+                    removed_count += 1
+
+        groups.remove(idx)
+        scn.sko_groups_index = min(idx, len(groups) - 1)
+
+        self.report({'INFO'}, f"Removed group '{group_name}' from list and cleared from {removed_count} keys.")
+        for area in context.screen.areas:
+            if area.type == 'PROPERTIES':
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
+class SKO_OT_GroupMove(Operator):
+    bl_idname = "shapekey_organizer.group_move"
+    bl_label = "Move"
+    bl_description = "Reorder groups in the list"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(items=[('UP','Up',''),('DOWN','Down','')], default='UP')
+
+    def execute(self, context):
+        scn = context.scene
+        idx = scn.sko_groups_index
+        groups = scn.sko_groups
+        if idx < 0 or idx >= len(groups):
+            return {'CANCELLED'}
+        new_idx = idx - 1 if self.direction == 'UP' else idx + 1
+        if new_idx < 0 or new_idx >= len(groups):
+            return {'CANCELLED'}
+        groups.move(idx, new_idx)
+        scn.sko_groups_index = new_idx
+        return {'FINISHED'}
+
+
+class SKO_OT_GroupSelectKeys(Operator):
+    bl_idname = "shapekey_organizer.group_select_keys"
+    bl_label = "Select Keys"
+    bl_description = "Select all keys tagged with the selected group (ignores Basis)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj or obj.type != 'MESH':
+            return {'CANCELLED'}
+        scn = context.scene
+        idx = scn.sko_groups_index
+        groups = scn.sko_groups
+        if idx < 0 or idx >= len(groups):
+            return {'CANCELLED'}
+        gname = groups[idx].name
+        for k in iter_keyblocks(obj):
+            if is_basis_key(obj, k):
+                continue
+            if get_group(k) == gname:
+                set_sel(k, True)
+        return {'FINISHED'}
+
+
+class SKO_OT_GroupFilterApply(Operator):
+    bl_idname = "shapekey_organizer.group_filter_apply"
+    bl_label = "Filter"
+    bl_description = "Filter the shapekey list to the selected group"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scn = context.scene
+        props = scn.shapekey_organizer
+        idx = scn.sko_groups_index
+        if idx < 0 or idx >= len(scn.sko_groups):
+            return {'CANCELLED'}
+        props.filter_group = scn.sko_groups[idx].name
+        return {'FINISHED'}
+
+
+class SKO_OT_GroupFilterClear(Operator):
+    bl_idname = "shapekey_organizer.group_filter_clear"
+    bl_label = "Clear Filter"
+    bl_description = "Clear the group filter in the list"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = context.scene.shapekey_organizer
+        props.filter_group = ""
+        return {'FINISHED'}
+
 # =====================================================
 # Panel
 # =====================================================
@@ -679,17 +940,16 @@ class SKO_PT_Main(Panel):
         box = layout.box()
         row = box.row(align=True)
         row.prop(props, 'search', text="Search")
-        row.prop(props, 'filter_group', text="Group")
-        row.prop(props, 'list_rows', text="Rows")
 
         # List
         list_row = box.row(align=True)
-        list_row.template_list("SKO_UL_shapekeys", "", obj.data.shape_keys, "key_blocks", obj, "active_shape_key_index", rows=props.list_rows)
+        list_row.template_list("SKO_UL_shapekeys", "", obj.data.shape_keys, "key_blocks", obj, "active_shape_key_index", rows=10)
         controls = box.row(align=True)
         controls.operator("shapekey_organizer.select_all")
         controls.operator("shapekey_organizer.select_none")
         controls.operator("shapekey_organizer.select_invert")
         controls.operator("shapekey_organizer.sync_state")
+        box.label(text="Tip: Shift-click a checkbox to select a range.")
 
         layout.separator()
 
@@ -715,9 +975,22 @@ class SKO_PT_Main(Panel):
         hdr.label(text="Groups")
         if props.show_groups:
             r = grp.row(align=True)
-            r.operator("shapekey_organizer.assign_group", text="Assign").group = props.filter_group
-            r.operator("shapekey_organizer.clear_group", text="Clear")
-            grp.label(text="Tip: Set 'Group' filter above, then click Assign to tag selected with that group name.")
+            r.prop(props, 'group_search', text="Group")
+            r.operator("shapekey_organizer.group_add", text="Add")
+
+            rr = grp.row(align=True)
+            rr.template_list("SKO_UL_groups", "", context.scene, "sko_groups", context.scene, "sko_groups_index", rows=5)
+            col = rr.column(align=True)
+            col.operator("shapekey_organizer.group_move", text="Up").direction = 'UP'
+            col.operator("shapekey_organizer.group_move", text="Down").direction = 'DOWN'
+            col.separator()
+            col.operator("shapekey_organizer.group_remove", text="Remove")
+
+            r2 = grp.row(align=True)
+            r2.operator("shapekey_organizer.group_select_keys", text="Select Keys")
+            r2.operator("shapekey_organizer.group_filter_apply", text="Filter")
+            r2.operator("shapekey_organizer.group_filter_clear", text="Clear Filter")
+            grp.label(text=f"Active filter: '{props.filter_group or 'None'}'")
 
         layout.separator()
 
@@ -768,8 +1041,10 @@ class SKO_PT_Main(Panel):
 
 classes = (
     SKO_Item,
+    SKO_GroupItem,
     SKO_Props,
     SKO_UL_ShapeKeys,
+    SKO_UL_Groups,
     SKO_OT_ToggleSelect,
     SKO_OT_SelectAll,
     SKO_OT_SelectNone,
@@ -785,6 +1060,12 @@ classes = (
     SKO_OT_SetSliderRange,
     SKO_OT_ResetValues,
     SKO_OT_SyncState,
+    SKO_OT_GroupAdd,
+    SKO_OT_GroupRemove,
+    SKO_OT_GroupMove,
+    SKO_OT_GroupSelectKeys,
+    SKO_OT_GroupFilterApply,
+    SKO_OT_GroupFilterClear,
     SKO_PT_Main,
 )
 
@@ -794,6 +1075,8 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Scene.shapekey_organizer = bpy.props.PointerProperty(type=SKO_Props)
     bpy.types.Scene.sko_items = CollectionProperty(type=SKO_Item)
+    bpy.types.Scene.sko_groups = CollectionProperty(type=SKO_GroupItem)
+    bpy.types.Scene.sko_groups_index = IntProperty(default=-1)
 
 
 def unregister():
@@ -802,6 +1085,10 @@ def unregister():
     del bpy.types.Scene.shapekey_organizer
     if hasattr(bpy.types.Scene, 'sko_items'):
         del bpy.types.Scene.sko_items
+    if hasattr(bpy.types.Scene, 'sko_groups'):
+        del bpy.types.Scene.sko_groups
+    if hasattr(bpy.types.Scene, 'sko_groups_index'):
+        del bpy.types.Scene.sko_groups_index
 
 
 if __name__ == "__main__":

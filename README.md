@@ -14,7 +14,7 @@ Blender Shapekey Add-Ons is a powerful and user-friendly toolset for managing, o
 ## Installation
 1. Download the latest release from the [Releases](https://github.com/LupisYoung/Blender-Shapekey-Addons/releases) page.
 2. In Blender, go to **Edit → Preferences → Add-ons → Install...**
-3. Select the downloaded `.zip` file,
+3. Select the downloaded `.zip` file.
 4. Enable the add-on.
 
 ## Location in Blender
