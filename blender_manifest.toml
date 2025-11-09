@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "blender_shapekey_addons"
+
+version = "1.0.0"
+
+name = "Blender Shapekey Add-Ons"
+
+tagline = "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys"
+
+maintainer = "LupisYoung"
+
+type = "add-on"
+
+website = "https://github.com/LupisYoung/Blender-Shapekey-Addons"
+
+tags = ["Mesh", "Object", "User Interface"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
