@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Shapekey Add-Ons",
     "author": "LupisYoung",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "Object Data Properties > Shape Keys",
     "description": "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys.",
@@ -19,7 +19,8 @@ import json
 import urllib.request
 import urllib.error
 from bpy.types import Operator, Panel, PropertyGroup, UIList, AddonPreferences
-import re
+import os, sys, re
+import time
 from bpy.props import (
     BoolProperty,
     StringProperty,
@@ -28,6 +29,14 @@ from bpy.props import (
     FloatProperty,
     CollectionProperty,
 )
+
+try:
+    import tomllib as _toml
+except Exception:
+    _toml = None
+
+_DBL_CLICK = {"name": "", "t": 0.0}
+_DBL_THRESHOLD = 0.30
 
 # =====================================================
 # Helpers & state
@@ -39,113 +48,112 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
 _ADDON_ID = __package__ or __name__.split(".", 1)[0]
 
-def _current_version_tuple():
-    """
-    Returns (major, minor, patch) from, in order:
-    - this module's bl_info['version']
-    - this module's __version__ string
-    - Blender's registered add-on module bl_info['version'] or __version__
-    - fallback (0, 0, 0)
-    """
-    import sys
-    import bpy
+_MANIFEST_VERSION_CACHE_STR = None
+_MANIFEST_VERSION_CACHE_TUP = None
 
-    mod = sys.modules.get(__name__)
-    if mod:
-        try:
-            vi = getattr(mod, "bl_info", {}).get("version", None)
-            if isinstance(vi, (tuple, list)) and len(vi) >= 1:
-                a = list(vi[:3]) + [0, 0]
-                return tuple(int(x) for x in a[:3])
-        except Exception:
-            pass
-        try:
-            vstr = getattr(mod, "__version__", "")
-            if isinstance(vstr, str) and vstr:
-                parts = vstr.split(".")
-                nums = []
-                for p in parts[:3]:
-                    try:
-                        nums.append(int(p))
-                    except Exception:
-                        nums.append(0)
-                while len(nums) < 3:
-                    nums.append(0)
-                return tuple(nums)
-        except Exception:
-            pass
+def _manifest_path():
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(pkg_dir, "blender_manifest.toml")
+    return p if os.path.isfile(p) else None
+
+def _manifest_version_str():
+    """Return exact version string from blender_manifest.toml (e.g. '1.3.0-pre1'), or ''."""
+    global _MANIFEST_VERSION_CACHE_STR
+    if _MANIFEST_VERSION_CACHE_STR is not None:
+        return _MANIFEST_VERSION_CACHE_STR
+
+    path = _manifest_path()
+    if not path:
+        _MANIFEST_VERSION_CACHE_STR = ""
+        return _MANIFEST_VERSION_CACHE_STR
 
     try:
-        addon_id = __package__ or __name__.split(".", 1)[0]
-        entry = bpy.context.preferences.addons.get(addon_id)
-        reg_mod = getattr(entry, "module", None) if entry else None
-        if reg_mod:
-            vi = getattr(reg_mod, "bl_info", {}).get("version", None)
-            if isinstance(vi, (tuple, list)) and len(vi) >= 1:
-                a = list(vi[:3]) + [0, 0]
-                return tuple(int(x) for x in a[:3])
-            vstr = getattr(reg_mod, "__version__", "")
-            if isinstance(vstr, str) and vstr:
-                parts = vstr.split(".")
-                nums = []
-                for p in parts[:3]:
-                    try:
-                        nums.append(int(p))
-                    except Exception:
-                        nums.append(0)
-                while len(nums) < 3:
-                    nums.append(0)
-                return tuple(nums)
+        with open(path, "rb") as f:
+            if _toml:
+                data = _toml.load(f)
+                v = (data.get("version")
+                     or (data.get("addon") or {}).get("version")
+                )
+                _MANIFEST_VERSION_CACHE_STR = str(v or "").strip()
+            else:
+                raw = f.read().decode("utf-8", "ignore")
+                m = re.search(r'^\s*version\s*=\s*"([^"]+)"\s*$', raw, flags=re.M)
+                _MANIFEST_VERSION_CACHE_STR = (m.group(1).strip() if m else "")
+    except Exception:
+        _MANIFEST_VERSION_CACHE_STR = ""
+    return _MANIFEST_VERSION_CACHE_STR
+
+def _parse_semver_to_tuple(vstr: str):
+    """
+    Convert '1.3.0-pre1' -> (1,3,0, 'pre1') and comparison tuple (1,3,0,-1)
+    """
+    if not vstr:
+        return (0, 0, 0, ""), (0, 0, 0, 0)
+    t = vstr[1:] if vstr[:1].lower() == "v" else vstr
+    core = re.split(r'[-+]', t, maxsplit=1)[0]
+    parts = core.split(".")[:3]
+    nums = [int(p) if p.isdigit() else 0 for p in parts] + [0, 0, 0]
+    major, minor, patch = nums[:3]
+    suffix = ""
+    m = re.search(r'-(.+)$', t)
+    if m: suffix = m.group(1)
+    cmp = (major, minor, patch, -1 if suffix else 0)
+    return (major, minor, patch, suffix), cmp
+
+def _current_version_tuple():
+    """
+    Prefer version from blender_manifest.toml.
+    Falls back to bl_info/ __version__ if manifest missing.
+    """
+    vstr = _manifest_version_str()
+    if vstr:
+        _full, cmp = _parse_semver_to_tuple(vstr)
+        return tuple(cmp[:3])
+
+    try:
+        vi = bl_info.get("version", (0, 0, 0))
+        return tuple(int(x) for x in list(vi[:3]) + [0, 0])[:3]
     except Exception:
         pass
 
+    vstr = globals().get("__version__", "")
+    if isinstance(vstr, str) and vstr:
+        full, _cmp = _parse_semver_to_tuple(vstr)
+        return tuple(full[:3])
+
     return (0, 0, 0)
-    if isinstance(vi, str):
-        parts = vi.split(".")[:3]
-        out = []
-        for p in parts:
-            try:
-                out.append(int(p))
-            except ValueError:
-                out.append(0)
-        while len(out) < 3:
-            out.append(0)
-        return tuple(out)
-    return (0, 0, 0)
+
+def current_version_display():
+    """Human-readable version for UI—shows prerelease if present."""
+    vstr = _manifest_version_str()
+    if vstr:
+        return vstr
+    v = bl_info.get("version", (0, 0, 0))
+    return ".".join(map(str, v))
 
 
 def _parse_version_tag(tag: str):
-    """Parse 'v1.2.3' or '1.2.3' into (1,2,3). Unknown/missing -> (0,0,0)."""
+    """Parse GitHub tags like 'v1.3.0-pre1' into a comparison tuple."""
     if not tag:
-        return (0, 0, 0)
-    t = tag[1:] if tag[:1] in ("v", "V") else tag
-    parts = t.strip().split(".")[:3]
-    out = []
-    for p in parts:
-        try:
-            out.append(int(p))
-        except ValueError:
-            out.append(0)
-    while len(out) < 3:
-        out.append(0)
-    return tuple(out)
+        return (0, 0, 0, 0)
+    _full, cmp = _parse_semver_to_tuple(tag)
+    return cmp
 
 
 def _fetch_latest_tag():
     """Return latest release tag_name from GitHub Releases API, or '' on failure."""
-    ua = "Blender-Shapekey-Add-Ons/{}".format(".".join(map(str, _current_version_tuple())) or "0.0.0")
+    ua = f"Blender-Shapekey-Add-Ons/{_manifest_version_str() or '0.0.0'}"
     req = urllib.request.Request(GITHUB_LATEST_API, headers={"User-Agent": ua})
     try:
         with urllib.request.urlopen(req, timeout=6) as resp:
             data = json.loads(resp.read().decode("utf-8", "ignore"))
         return data.get("tag_name") or ""
-    except urllib.error.HTTPError as e:
-        return ""
     except Exception:
         return ""
 
 
-class SKO_OT_CheckUpdates(Operator):
+
+class SKO_OT_CheckUpdates(bpy.types.Operator):
     bl_idname = "shapekey_organizer.check_updates"
     bl_label = "Check for Updates"
     bl_description = "Check GitHub for a newer version of this add-on"
@@ -159,19 +167,24 @@ class SKO_OT_CheckUpdates(Operator):
     )
 
     def execute(self, context):
-        current = _current_version_tuple()
+        current_str = current_version_display()
+        current_cmp = _parse_version_tag(current_str)
         latest_tag = _fetch_latest_tag()
-        latest = _parse_version_tag(latest_tag)
+        latest_cmp = _parse_version_tag(latest_tag)
 
-        if latest > current:
-            msg = f"New version available: {latest_tag or 'unknown'} (current {'.'.join(map(str, current))})."
+        if latest_tag == "":
+            msg = "Could not determine latest version (GitHub API unavailable)."
+            if not self.silent_if_latest:
+                self._popup(context, msg, show_open=True)
+            return {'CANCELLED'}
+
+        if latest_cmp > current_cmp:
+            msg = f"New version available: {latest_tag} (current v{current_str})."
             self._popup(context, msg, show_open=True)
         else:
+            msg = f"You are on the latest version (v{current_str})."
             if not self.silent_if_latest:
-                if latest_tag == "":
-                    self._popup(context, "Could not determine latest version (GitHub API unavailable).", show_open=True)
-                else:
-                    self._popup(context, "You are on the latest version.", show_open=False)
+                self._popup(context, msg, show_open=False)
         return {'FINISHED'}
 
     def _popup(self, context, message, show_open=True):
@@ -472,22 +485,59 @@ class SKO_Props(PropertyGroup):
 class SKO_UL_ShapeKeys(UIList):
     bl_idname = "SKO_UL_shapekeys"
 
+    def draw_filter(self, context, layout):
+        pass
+
+    def filter_items(self, context, data, propname):
+        self.use_filter_show = False
+        self.use_filter_invert = False
+        self.use_filter_sort_alpha = False
+        self.use_filter_sort_reverse = False
+
+        try:
+            items = getattr(data, propname)
+        except Exception:
+            items = []
+        flags = [self.bitflag_filter_item] * len(items)
+        return flags, list(range(len(items)))
+
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         key = item
         if not key:
             return
         sel = get_sel(key)
         row = layout.row(align=True)
-        row.prop(key, 'name', text="", emboss=True)
+
+        obj = context.object
+        is_active = (getattr(obj, "active_shape_key_index", -1) == index)
+        sel = get_sel(key)
+
+        split = layout.split(factor=0.5)
+        left  = split.row(align=True)
+        right = split.row(align=True)
+
+        if is_active:
+            left.active = True
+            right.active = True
+
+        name_row = left.row(align=True)
+        name_row.alignment = 'LEFT'
+        btn = name_row.operator("shapekey_organizer.key_click", text=key.name, emboss=False)
+        btn.key_name = key.name
+        btn.key_index = index
 
         g = get_group(key)
         if g:
-            tag = row.row(align=True)
-            tag.label(text=g, icon='GROUP')
+            left.label(text=g, icon='GROUP')
 
-        row.prop(key, 'value', text="")
-        row.prop(key, 'mute', text="", icon_only=True, icon='HIDE_OFF')
-        op = row.operator("shapekey_organizer.toggle_select", text="", icon='CHECKBOX_HLT' if sel else 'CHECKBOX_DEHLT', depress=sel)
+        right.prop(key, 'value', text="")
+        right.prop(key, 'mute', text="", icon_only=True, icon='HIDE_OFF')
+        op = right.operator(
+            "shapekey_organizer.toggle_select",
+            text="",
+            icon='CHECKBOX_HLT' if sel else 'CHECKBOX_DEHLT',
+            depress=sel
+        )
         op.key_name = key.name
 
     def filter_items(self, context, data, propname):
@@ -514,6 +564,22 @@ class SKO_UL_ShapeKeys(UIList):
 class SKO_UL_Groups(UIList):
     bl_idname = "SKO_UL_groups"
 
+    def draw_filter(self, context, layout):
+        pass
+
+    def filter_items(self, context, data, propname):
+        self.use_filter_show = False
+        self.use_filter_invert = False
+        self.use_filter_sort_alpha = False
+        self.use_filter_sort_reverse = False
+
+        try:
+            items = getattr(data, propname)
+        except Exception:
+            items = []
+        flags = [self.bitflag_filter_item] * len(items)
+        return flags, list(range(len(items)))
+
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         if not item:
             return
@@ -523,6 +589,440 @@ class SKO_UL_Groups(UIList):
 # =====================================================
 # Operators
 # =====================================================
+
+class SKO_OT_ToggleUseEditMode(bpy.types.Operator):
+    bl_idname = "shapekey_organizer.toggle_use_edit_mode"
+    bl_label = "Shape Key Edit Mode"
+    bl_description = "Display shape keys in edit mode (for meshes only)."
+    bl_options = {'INTERNAL', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj: return {'CANCELLED'}
+        obj.use_shape_key_edit_mode = not obj.use_shape_key_edit_mode
+        return {'FINISHED'}
+
+
+class SKO_OT_ToggleShowOnly(bpy.types.Operator):
+    bl_idname = "shapekey_organizer.toggle_show_only"
+    bl_label = "Solo Active Shape Key"
+    bl_description = "Only show the active shapekey at full value."
+    bl_options = {'INTERNAL', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.object
+        if not obj: return {'CANCELLED'}
+        obj.show_only_shape_key = not obj.show_only_shape_key
+        return {'FINISHED'}
+
+
+class SKO_OT_KeyActivateOrRename(Operator):
+    bl_idname = "shapekey_organizer.key_click"
+    bl_label = "Rename Shapekey"
+    bl_description = "Single-click: set active. Quick second click: rename."
+    bl_options = {'REGISTER', 'UNDO'}
+
+    key_name: StringProperty(options={'SKIP_SAVE'})
+    key_index: IntProperty(default=-1, options={'SKIP_SAVE'})
+    new_name: StringProperty(name="New Name", default="", options={'SKIP_SAVE'})
+
+    def invoke(self, context, event):
+        obj = active_obj_mesh(context)
+        if not obj:
+            return {'CANCELLED'}
+
+        now = time.perf_counter()
+        if _DBL_CLICK["name"] == self.key_name and (now - _DBL_CLICK["t"]) <= _DBL_THRESHOLD:
+            _DBL_CLICK["name"] = ""
+            self.new_name = self.key_name
+            return context.window_manager.invoke_props_dialog(self, width=260)
+
+        idx = self.key_index
+        if idx < 0:
+            ks = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None) or []
+            for i, kb in enumerate(ks):
+                if kb.name == self.key_name:
+                    idx = i
+                    break
+        if idx >= 0:
+            obj.active_shape_key_index = idx
+
+        _DBL_CLICK["name"] = self.key_name
+        _DBL_CLICK["t"] = now
+        try:
+            for win in bpy.context.window_manager.windows:
+                for area in win.screen.areas:
+                    if area.type == 'PROPERTIES':
+                        area.tag_redraw()
+        except Exception:
+            pass
+
+        return {'FINISHED'}
+
+    def draw(self, context):
+        self.layout.prop(self, "new_name", text="")
+
+    def execute(self, context):
+        obj = active_obj_mesh(context)
+        if not obj:
+            return {'CANCELLED'}
+        ks = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+        if not ks:
+            return {'CANCELLED'}
+
+        kb = ks.get(self.key_name)
+        if not kb:
+            return {'CANCELLED'}
+
+        new = self.new_name.strip()
+        if new and new != kb.name:
+            it = ensure_item_by_name(kb.name, create=True)
+            kb.name = new
+            if it:
+                it.key_name = new
+        return {'FINISHED'}
+
+
+class SKO_OT_ShapeKeyAdd(Operator):
+    bl_idname = "shapekey_organizer.shape_key_add"
+    bl_label = "Create Shapekey"
+    bl_description = "Create a new shapekey (empty, from full mix, or from selected-only mix)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Mode",
+        description="How to create the new shapekey",
+        items=[
+            ('EMPTY',       "New (Empty)",              "Create an empty shapekey"),
+            ('MIX_ALL',     "From Mix (All Visible)",   "Bake all currently visible deformation"),
+            ('MIX_SELECTED',"From Mix (Selected Only)", "Bake only selected shapekeys (optionally only visible)"),
+            ('DUP_SELECTED',"Duplicate Selected",       "Make a copy of each selected shapekey (ignores Basis)"),
+        ],
+        default='EMPTY'
+    )
+
+    key_name: StringProperty(
+        name = "Name",
+        description="Optional name; if duplicating multiple keys, this will be used as a prefix",
+        default="",
+        options={'SKIP_SAVE'}
+    )
+
+    # Only used when mode == MIX_SELECTED
+    visible_only: BoolProperty(
+        name="Only Visible (Filtered)",
+        description="Limit to keys that are visible in the list (respects Search/Group filter)",
+        default=False
+    )
+    include_zero: BoolProperty(
+        name="Include Zero Values",
+        description="Include selected keys even if their current value is 0.0",
+        default=False
+    )
+
+    # Only used when mode == DUP_SELECTED
+    duplicate_suffix: bpy.props.StringProperty(
+        name="Suffix",
+        description="Suffix for duplicated names (when no explicit name is given)",
+        default="",
+        options={'SKIP_SAVE'},
+    )
+
+    def invoke(self, context, event):
+        self.key_name = ""
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "mode", text="")
+
+        col = layout.column(align=True)
+        name_label = "Prefix" if self.mode == 'DUP_SELECTED' else "Name"
+        col.prop(self, "key_name", text=name_label)
+
+        if self.mode == 'MIX_SELECTED':
+            box = layout.box()
+            box.label(text="From Selected Options")
+            row = box.row(align=False)
+            row.prop(self, "visible_only")
+            row.prop(self, "include_zero")
+
+        elif self.mode == 'DUP_SELECTED':
+            col = layout.column(align=True)
+            col.prop(self, "duplicate_suffix")
+            box = layout.box()
+            box.label(text="Tip: If Prefix and Suffix are empty,")
+            box.label(text="Duplicates are suffixed with .001, .002, etc.")
+
+    def execute(self, context):
+        obj = active_obj_mesh(context)
+        if not obj:
+            self.report({'WARNING'}, "Select a mesh object with shapekeys.")
+            return {'CANCELLED'}
+
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+        def _finalize_new_key():
+            ks = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+            if not ks:
+                return None
+            new_key = ks[-1]
+            if self.key_name.strip():
+                new_key.name = self.key_name.strip()
+            obj.active_shape_key_index = len(ks) - 1
+            it = ensure_item_by_name(new_key.name, create=True)
+            if it:
+                it.selected = True
+            try:
+                bpy.context.view_layer.update()
+                for win in bpy.context.window_manager.windows:
+                    for area in win.screen.areas:
+                        if area.type in {'PROPERTIES', 'VIEW_3D'}:
+                            area.tag_redraw()
+            except Exception:
+                pass
+            return new_key
+
+        if self.mode == 'EMPTY':
+            try:
+                bpy.ops.object.shape_key_add(from_mix=False)
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not create shapekey: {e}")
+                return {'CANCELLED'}
+            new_key = _finalize_new_key()
+            self.report({'INFO'}, f"Created shapekey: {new_key.name if new_key else '(unknown)'}")
+            self.key_name = ""
+            return {'FINISHED'}
+
+        if self.mode == 'MIX_ALL':
+            try:
+                bpy.ops.object.shape_key_add(from_mix=True)
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not create shapekey from mix: {e}")
+                return {'CANCELLED'}
+            new_key = _finalize_new_key()
+            self.report({'INFO'}, f"Captured full mix to: {new_key.name if new_key else '(unknown)'}")
+            self.key_name = ""
+            return {'FINISHED'}
+
+        if self.mode == 'DUP_SELECTED':
+            obj = active_obj_mesh(context)
+            if not obj:
+                self.report({'WARNING'}, "Select a mesh object with shapekeys.")
+                return {'CANCELLED'}
+
+            ks = list(iter_keyblocks(obj))
+            if not ks:
+                self.report({'WARNING'}, "No shapekeys to duplicate.")
+                return {'CANCELLED'}
+
+            targets = [k for k in ks if not is_basis_key(obj, k) and get_sel(k)]
+            if not targets:
+                self.report({'INFO'}, "No selected shapekeys to duplicate.")
+                return {'CANCELLED'}
+
+            values_cache = {k.name: float(getattr(k, "value", 0.0)) for k in ks}
+
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+
+            created = 0
+            last_new_name = ""
+
+            multi = (len(targets) > 1)
+            name_prefix = self.key_name.strip()
+            suffix = self.duplicate_suffix
+
+            for src in targets:
+                for k in ks:
+                    try:
+                        k.value = 0.0
+                    except Exception:
+                        pass
+                try:
+                    src.value = 1.0
+                except Exception:
+                    pass
+
+                try:
+                    bpy.ops.object.shape_key_add(from_mix=True)
+                except Exception as e:
+                    for k in ks:
+                        try:
+                            k.value = values_cache.get(k.name, 0.0)
+                        except Exception:
+                            pass
+                    self.report({'ERROR'}, f"Duplicate failed on '{src.name}': {e}")
+                    return {'CANCELLED'}
+
+                new_key = obj.data.shape_keys.key_blocks[-1]
+
+                if multi:
+                    new_key.name = f"{name_prefix}{src.name}{suffix}"
+                else:
+                    base_name = name_prefix if name_prefix and not multi else src.name
+                    if name_prefix and not multi:
+                        new_key.name = f"{name_prefix}{suffix}"
+                    else:
+                        new_key.name = f"{name_prefix}{src.name}{suffix}"
+
+
+                try:
+                    new_key.slider_min = float(getattr(src, "slider_min", 0.0))
+                    new_key.slider_max = float(getattr(src, "slider_max", 1.0))
+                except Exception:
+                    pass
+
+                obj.active_shape_key_index = len(obj.data.shape_keys.key_blocks) - 1
+                it = ensure_item_by_name(new_key.name, create=True)
+                if it:
+                    it.selected = True
+
+                last_new_name = new_key.name
+                created += 1
+
+                for k in ks:
+                    try:
+                        k.value = values_cache.get(k.name, 0.0)
+                    except Exception:
+                        pass
+
+            try:
+                bpy.context.view_layer.update()
+                for win in bpy.context.window_manager.windows:
+                    for area in win.screen.areas:
+                        if area.type in {'PROPERTIES', 'VIEW_3D'}:
+                            area.tag_redraw()
+            except Exception:
+                pass
+
+            self.key_name = ""
+
+            self.report({'INFO'}, f"Duplicated {created} shapekey(s).")
+            return {'FINISHED'}
+
+
+        # MIX_SELECTED
+        ks = list(iter_keyblocks(obj))
+        if not ks:
+            self.report({'WARNING'}, "No shapekeys to combine.")
+            return {'CANCELLED'}
+
+        pool = filtered_keys(context, obj) if self.visible_only else ks
+
+        values_cache = {k.name: float(getattr(k, "value", 0.0)) for k in ks}
+
+        include = []
+        for k in pool:
+            if is_basis_key(obj, k):
+                continue
+            if not get_sel(k):
+                continue
+            if not self.include_zero and values_cache.get(k.name, 0.0) == 0.0:
+                continue
+            include.append(k)
+
+        if not include:
+            self.report({'INFO'}, "No selected (and eligible) shapekeys to combine.")
+            return {'CANCELLED'}
+
+        for k in ks:
+            try:
+                k.value = 0.0
+            except Exception:
+                pass
+
+        for k in include:
+            try:
+                k.value = values_cache.get(k.name, 0.0)
+            except Exception:
+                pass
+
+        try:
+            bpy.ops.object.shape_key_add(from_mix=True)
+        except Exception as e:
+            for k in ks:
+                try:
+                    k.value = values_cache.get(k.name, 0.0)
+                except Exception:
+                    pass
+            self.report({'ERROR'}, f"Could not create shapekey from selected mix: {e}")
+            return {'CANCELLED'}
+
+        new_key = _finalize_new_key()
+
+        for k in ks:
+            try:
+                k.value = values_cache.get(k.name, 0.0)
+            except Exception:
+                pass
+
+        self.report({'INFO'}, f"Created '{new_key.name if new_key else '(unknown)'}' from {len(include)} selected key(s).")
+        self.key_name = ""
+        return {'FINISHED'}
+
+class SKO_OT_ShapeKeyRemoveSelected(Operator):
+    bl_idname = "shapekey_organizer.shape_key_remove_selected"
+    bl_label = "Delete Selected"
+    bl_description = "Delete all selected shapekeys (Basis is ignored)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _delete_count: IntProperty(default=0, options={'SKIP_SAVE'})
+
+    def _gather_selection(self, context):
+        obj = active_obj_mesh(context)
+        if not obj:
+            return obj, []
+        ks = list(iter_keyblocks(obj)) or []
+        to_remove = [i for i, k in enumerate(ks) if not is_basis_key(obj, k) and get_sel(k)]
+        return obj, to_remove
+
+    def invoke(self, context, event):
+        obj, to_remove = self._gather_selection(context)
+        if not obj:
+            self.report({'WARNING'}, "No mesh object selected.")
+            return {'CANCELLED'}
+        if not to_remove:
+            self.report({'INFO'}, "No shapekeys selected to delete.")
+            return {'CANCELLED'}
+
+        self._delete_count = len(to_remove)
+        return context.window_manager.invoke_props_dialog(self, width=240)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text=f"Delete {self._delete_count} shapekey(s)?")
+
+    def execute(self, context):
+        obj, to_remove = self._gather_selection(context)
+        if not obj or not to_remove:
+            return {'CANCELLED'}
+
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+        removed = 0
+        for i in sorted(to_remove, reverse=True):
+            obj.active_shape_key_index = i
+            try:
+                bpy.ops.object.shape_key_remove(all=False)
+                removed += 1
+            except Exception:
+                pass
+
+        for k in iter_keyblocks(obj):
+            ensure_item_by_name(k.name, create=True)
+
+        self.report({'INFO'}, f"Deleted {removed} shapekey(s).")
+        return {'FINISHED'}
+
 
 class SKO_OT_ToggleSelect(Operator):
     bl_idname = "shapekey_organizer.toggle_select"
@@ -1216,14 +1716,36 @@ class SKO_PT_Main(Panel):
         obj = context.object
         props = context.scene.shapekey_organizer
 
+        # Updates
+        entry = bpy.context.preferences.addons.get(_ADDON_ID)
+        prefs = entry.preferences if entry else None
+        row = layout.row(align=True)
+        if prefs:
+            row.prop(prefs, "auto_check", text="Check on Startup")
+        row.operator("shapekey_organizer.check_updates", text="Check for Updates", icon='FILE_REFRESH')
+        row = layout.row(align=True)
+        row.alignment = 'RIGHT'
+        row.label(text=f"Installed: v{current_version_display()}")
+
         # Filters
+        state_edit = bool(getattr(obj, "use_shape_key_edit_mode", False))
+        state_solo = bool(getattr(obj, "show_only_shape_key", False))
+
         box = layout.box()
         row = box.row(align=True)
         row.prop(props, 'search', text="Search")
+        layout.separator()
+        row.operator("shapekey_organizer.toggle_show_only",
+            text="", icon=('SOLO_ON' if obj.show_only_shape_key else 'SOLO_OFF'), depress=state_solo)
+        row.operator("shapekey_organizer.toggle_use_edit_mode",
+            text="", icon=('EDITMODE_HLT'), depress=state_edit)
 
         # List
         list_row = box.row(align=True)
         list_row.template_list("SKO_UL_shapekeys", "", obj.data.shape_keys, "key_blocks", obj, "active_shape_key_index", rows=10)
+        row = box.row(align=True)
+        row.operator("shapekey_organizer.shape_key_add", text="Create…", icon='ADD')
+        row.operator("shapekey_organizer.shape_key_remove_selected", text="Delete Selected", icon='TRASH')
         controls = box.row(align=True)
         controls.operator("shapekey_organizer.select_all")
         controls.operator("shapekey_organizer.select_none")
@@ -1336,6 +1858,11 @@ classes = (
     SKO_AddonPreferences,
     SKO_UL_ShapeKeys,
     SKO_UL_Groups,
+    SKO_OT_ToggleUseEditMode,
+    SKO_OT_ToggleShowOnly,
+    SKO_OT_KeyActivateOrRename,
+    SKO_OT_ShapeKeyAdd,
+    SKO_OT_ShapeKeyRemoveSelected,
     SKO_OT_CheckUpdates,
     SKO_OT_ToggleSelect,
     SKO_OT_SelectAll,
