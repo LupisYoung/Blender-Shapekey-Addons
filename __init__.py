@@ -1,8 +1,8 @@
 bl_info = {
     "name": "Blender Shapekey Add-Ons",
     "author": "LupisYoung",
-    "version": (1, 4, 0),
-    "blender": (4, 0, 0),
+    "version": (1, 4, 1),
+    "blender": (3, 6, 0),
     "location": "Object Data Properties > Shape Keys",
     "description": "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys.",
     "warning": "",
