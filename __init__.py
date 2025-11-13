@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Shapekey Add-Ons",
     "author": "LupisYoung",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 0, 0),
     "location": "Object Data Properties > Shape Keys",
     "description": "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys.",
@@ -151,6 +151,70 @@ def _fetch_latest_tag():
     except Exception:
         return ""
 
+
+def _elide(text: str, max_len: int = 14) -> str:
+    text = text or ""
+    return text if len(text) <= max_len else (text[:max_len - 1] + "…")
+
+
+def _sko_split_keyblock_half(obj, src_key, axis='X', eps=1e-4, keep_side='LEFT', use_median_plane=False):
+    """
+    Zero out the opposite half of src_key (relative to Basis), by copying Basis coords.
+    keep_side: 'LEFT' or 'RIGHT' (negative vs positive side along the chosen axis).
+    If use_median_plane is True, split around the median coordinate of Basis on that axis.
+    """
+    sk = obj.data.shape_keys
+    if not sk or not src_key or src_key == sk.key_blocks[0]:
+        return 0
+
+    basis = sk.key_blocks[0]
+    kd = src_key.data
+    bd = basis.data
+    n = len(kd)
+
+    comp_idx = {'X': 0, 'Y': 1, 'Z': 2}.get(axis.upper(), 0)
+
+    if use_median_plane:
+        coords = [bd[i].co[comp_idx] for i in range(n)]
+        coords.sort()
+        mid = len(coords) // 2
+        plane = (coords[mid] if (len(coords) % 2 == 1) else 0.5 * (coords[mid - 1] + coords[mid]))
+    else:
+        plane = 0.0
+
+    changed = 0
+    for i in range(n):
+        v = bd[i].co[comp_idx] - plane
+        if keep_side == 'LEFT':
+            kill = (v > eps)
+        else:
+            kill = (v < -eps)
+
+        if kill:
+            kd[i].co = bd[i].co
+            changed += 1
+
+    return changed
+
+
+def get_target_keys(context, *, require_selected=True, visible_only=True,
+                    fallback_to_active=True, exclude_basis=True):
+    obj = context.object
+    if not obj or obj.type != 'MESH':
+        return []
+
+    pool = filtered_keys(context, obj) if visible_only else list(iter_keyblocks(obj))
+    targets = [k for k in pool if get_sel(k)] if require_selected else list(pool)
+
+    if fallback_to_active and not targets:
+        ak = getattr(obj, "active_shape_key", None)
+        if ak and ((not exclude_basis) or not is_basis_key(obj, ak)):
+            if (not visible_only) or (ak in pool):
+                targets = [ak]
+
+    if exclude_basis:
+        targets = [k for k in targets if not is_basis_key(context.object, k)]
+    return targets
 
 
 class SKO_OT_CheckUpdates(bpy.types.Operator):
@@ -488,29 +552,16 @@ class SKO_UL_ShapeKeys(UIList):
     def draw_filter(self, context, layout):
         pass
 
-    def filter_items(self, context, data, propname):
-        self.use_filter_show = False
-        self.use_filter_invert = False
-        self.use_filter_sort_alpha = False
-        self.use_filter_sort_reverse = False
-
-        try:
-            items = getattr(data, propname)
-        except Exception:
-            items = []
-        flags = [self.bitflag_filter_item] * len(items)
-        return flags, list(range(len(items)))
-
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         key = item
         if not key:
             return
         sel = get_sel(key)
-        row = layout.row(align=True)
 
         obj = context.object
         is_active = (getattr(obj, "active_shape_key_index", -1) == index)
         sel = get_sel(key)
+        gname = get_group(key)
 
         split = layout.split(factor=0.5)
         left  = split.row(align=True)
@@ -520,15 +571,19 @@ class SKO_UL_ShapeKeys(UIList):
             left.active = True
             right.active = True
 
-        name_row = left.row(align=True)
+        left_split = left.split(factor=0.75)
+        name_row = left_split.row(align=True)
         name_row.alignment = 'LEFT'
         btn = name_row.operator("shapekey_organizer.key_click", text=key.name, emboss=False)
         btn.key_name = key.name
         btn.key_index = index
 
-        g = get_group(key)
-        if g:
-            left.label(text=g, icon='GROUP')
+        group_cell = left_split.row(align=True)
+        group_cell.alignment = 'RIGHT'
+        if gname:
+            group_cell.label(text=gname, icon='OUTLINER_COLLECTION')
+        else:
+            group_cell.separator()
 
         right.prop(key, 'value', text="")
         right.prop(key, 'mute', text="", icon_only=True, icon='HIDE_OFF')
@@ -696,7 +751,9 @@ class SKO_OT_ShapeKeyAdd(Operator):
             ('EMPTY',       "New (Empty)",              "Create an empty shapekey"),
             ('MIX_ALL',     "From Mix (All Visible)",   "Bake all currently visible deformation"),
             ('MIX_SELECTED',"From Mix (Selected Only)", "Bake only selected shapekeys (optionally only visible)"),
-            ('DUP_SELECTED',"Duplicate Selected",       "Make a copy of each selected shapekey (ignores Basis)"),
+            ('DUP_SELECTED',"Duplicate",                "Make a copy of each selected shapekey (ignores Basis)"),
+            ('DUP_MIRROR',  "Duplicate & Mirror",       "Duplicate each selected and mirror it"),
+            ('SPLIT',       "Duplicate & Split",        "Duplicate each selected and zero each half by axis"),
         ],
         default='EMPTY'
     )
@@ -728,6 +785,54 @@ class SKO_OT_ShapeKeyAdd(Operator):
         options={'SKIP_SAVE'},
     )
 
+    # Only used when mode == DUP_MIRROR
+    use_topology: bpy.props.BoolProperty(
+        name="Use Topology",
+        description="Use topology mapping when mirroring (safer on asymmetric meshes)",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+    # Only used when mode == SPLIT
+    split_axis: bpy.props.EnumProperty(
+        name="Axis",
+        description="Axis used to split the shapekey",
+        items=[('X','X','Split across X=0'), ('Y','Y','Split across Y=0'), ('Z','Z','Split across Z=0')],
+        default='X'
+    )
+
+    split_eps: bpy.props.FloatProperty(
+        name="Threshold",
+        description="Vertices within this distance of the split plane are kept (prevents tiny holes)",
+        default=0.0001, min=0.0, soft_max=0.01
+    )
+
+    split_left_token: bpy.props.StringProperty(
+        name="Left token",
+        description="Text appended for the left-half key",
+        default=""
+    )
+    split_right_token: bpy.props.StringProperty(
+        name="Right token",
+        description="Text appended for the right-half key",
+        default=""
+    )
+
+    keep_original: bpy.props.BoolProperty(
+        name="Keep Original",
+        description="Keep the original shapekey after creating left/right halves",
+        default=True,
+        options={'SKIP_SAVE'},
+    )
+
+    use_median_plane: bpy.props.BoolProperty(
+        name="Use Median Plane",
+        description="Split relative to the mesh’s median on the chosen axis (robust if the model isn’t centered on 0)",
+        default=False,
+        options={'SKIP_SAVE'},
+    )
+
+
     def invoke(self, context, event):
         self.key_name = ""
         return context.window_manager.invoke_props_dialog(self, width=360)
@@ -737,8 +842,9 @@ class SKO_OT_ShapeKeyAdd(Operator):
         layout.prop(self, "mode", text="")
 
         col = layout.column(align=True)
-        name_label = "Prefix" if self.mode == 'DUP_SELECTED' else "Name"
-        col.prop(self, "key_name", text=name_label)
+        if self.mode != 'SPLIT':
+            name_label = "Prefix" if self.mode in {'DUP_SELECTED', 'DUP_MIRROR'} else "Name"
+            col.prop(self, "key_name", text=name_label)
 
         if self.mode == 'MIX_SELECTED':
             box = layout.box()
@@ -748,17 +854,41 @@ class SKO_OT_ShapeKeyAdd(Operator):
             row.prop(self, "include_zero")
 
         elif self.mode == 'DUP_SELECTED':
-            col = layout.column(align=True)
             col.prop(self, "duplicate_suffix")
             box = layout.box()
             box.label(text="Tip: If Prefix and Suffix are empty,")
             box.label(text="Duplicates are suffixed with .001, .002, etc.")
+
+        elif self.mode == 'DUP_MIRROR':
+            col.prop(self, "duplicate_suffix", text="Suffix")
+            col.prop(self, "use_topology", text="Use Topology")
+            box = layout.box()
+            box.label(text="Tip: If Prefix and Suffix are empty,")
+            box.label(text="Duplicates are suffixed with \"_Mirror\"")
+
+        elif self.mode == 'SPLIT':
+            col.prop(self, "split_left_token", text="Left Suffix")
+            col.prop(self, "split_right_token", text="Right Suffix")
+
+            row = layout.row(align=True)
+            row.prop(self, "split_axis", expand=True)
+            row = layout.row(align=True)
+            row.prop(self, "split_eps")
+
+            row =  layout.row(align=True)
+            row.prop(self, "keep_original")
+            row.prop(self, "use_median_plane")
+            box = layout.box()
+            box.label(text="Tip: If Left and/or Right token are empty,")
+            box.label(text="Duplicates are suffixed with \"_L\" and \"_R\"")
 
     def execute(self, context):
         obj = active_obj_mesh(context)
         if not obj:
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
+
+        props = context.scene.shapekey_organizer
 
         try:
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -819,7 +949,11 @@ class SKO_OT_ShapeKeyAdd(Operator):
                 self.report({'WARNING'}, "No shapekeys to duplicate.")
                 return {'CANCELLED'}
 
-            targets = [k for k in ks if not is_basis_key(obj, k) and get_sel(k)]
+            targets = get_target_keys(context,
+                                      require_selected=props.affect_only_selected,
+                                      visible_only=True,
+                                      fallback_to_active=True,
+                                      exclude_basis=True)
             if not targets:
                 self.report({'INFO'}, "No selected shapekeys to duplicate.")
                 return {'CANCELLED'}
@@ -906,6 +1040,210 @@ class SKO_OT_ShapeKeyAdd(Operator):
             self.report({'INFO'}, f"Duplicated {created} shapekey(s).")
             return {'FINISHED'}
 
+        if self.mode == 'DUP_MIRROR':
+            obj = active_obj_mesh(context)
+            if not obj:
+                self.report({'WARNING'}, "Select a mesh object with shapekeys.")
+                return {'CANCELLED'}
+
+            ks = list(iter_keyblocks(obj))
+            if not ks:
+                self.report({'WARNING'}, "No shapekeys to mirror.")
+                return {'CANCELLED'}
+
+            targets = get_target_keys(context,
+                                      require_selected=props.affect_only_selected,
+                                      visible_only=True,
+                                      fallback_to_active=True,
+                                      exclude_basis=True)
+            if not targets:
+                self.report({'INFO'}, "No selected shapekeys to mirror.")
+                return {'CANCELLED'}
+
+            values_cache = {k.name: float(getattr(k, "value", 0.0)) for k in ks}
+
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+
+            created = 0
+            prefix = (self.key_name or "").strip()
+            suffix = self.duplicate_suffix
+
+            for src in targets:
+                for k in ks:
+                    try: k.value = 0.0
+                    except: pass
+                try:
+                    src.value = 1.0
+                except: pass
+
+                bpy.ops.object.mode_set(mode='OBJECT')
+                bpy.ops.object.shape_key_add(from_mix=True)
+
+                new_idx = len(obj.data.shape_keys.key_blocks) - 1
+                obj.active_shape_key_index = new_idx
+                new_k = obj.data.shape_keys.key_blocks[new_idx]
+
+                for k in ks:
+                    try: k.value = 0.0
+                    except: pass
+
+                try:
+                    bpy.ops.object.shape_key_mirror(use_topology=self.use_topology)
+                except Exception as e:
+                    self.report({'WARNING'}, f"Mirror failed on '{new_k.name}': {e}")
+
+                prefix = (self.key_name or "").strip()
+                suffix = self.duplicate_suffix
+                if not prefix and not suffix:
+                    suffix = "_Mirror"
+                new_k.name = f"{prefix}{src.name}{suffix}"
+                it = ensure_item_by_name(new_k.name, create=True)
+                if it: it.selected = True
+                created += 1
+
+                try:
+                    new_k.slider_min = float(getattr(src, "slider_min", 0.0))
+                    new_k.slider_max = float(getattr(src, "slider_max", 1.0))
+                except:
+                    pass
+
+                for k in ks:
+                    try: k.value = values_cache.get(k.name, 0.0)
+                    except: pass
+
+            try:
+                bpy.context.view_layer.update()
+                for win in bpy.context.window_manager.windows:
+                    for area in win.screen.areas:
+                        if area.type in {'PROPERTIES', 'VIEW_3D'}:
+                            area.tag_redraw()
+            except Exception:
+                pass
+
+            self.key_name = ""
+            self.report({'INFO'}, f"Duplicated & mirrored {created} shapekey(s).")
+            return {'FINISHED'}
+
+        elif self.mode == 'SPLIT':
+            obj = active_obj_mesh(context)
+            if not obj:
+                self.report({'WARNING'}, "Select a mesh object with shapekeys.")
+                return {'CANCELLED'}
+
+            ks = list(iter_keyblocks(obj))
+            if not ks:
+                self.report({'WARNING'}, "Object has no shapekeys to split.")
+                return {'CANCELLED'}
+
+            targets = get_target_keys(context,
+                                      require_selected=props.affect_only_selected,
+                                      visible_only=True,
+                                      fallback_to_active=True,
+                                      exclude_basis=True)
+            if not targets:
+                self.report({'WARNING'}, "Select one or more shapekeys (non-Basis) or set an active shapekey.")
+                return {'CANCELLED'}
+
+            values_cache = {k.name: float(getattr(k, "value", 0.0)) for k in ks}
+
+            left_tok  = (self.split_left_token  or "").strip() or "_L"
+            right_tok = (self.split_right_token or "").strip() or "_R"
+
+            created = 0
+            try:
+                try:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception:
+                    pass
+
+                for src in targets:
+                    for k in ks:
+                        try: k.value = 0.0
+                        except Exception: pass
+                    try:
+                        src.value = 1.0
+                    except Exception:
+                        pass
+
+                    bpy.ops.object.shape_key_add(from_mix=True)
+                    k_left = obj.data.shape_keys.key_blocks[-1]
+                    obj.active_shape_key_index = len(obj.data.shape_keys.key_blocks) - 1
+
+                    bpy.ops.object.shape_key_add(from_mix=True)
+                    k_right = obj.data.shape_keys.key_blocks[-1]
+                    obj.active_shape_key_index = len(obj.data.shape_keys.key_blocks) - 1
+
+                    k_left.name  = f"{src.name}{left_tok}"
+                    k_right.name = f"{src.name}{right_tok}"
+
+                    try:
+                        for nk in (k_left, k_right):
+                            nk.slider_min = float(getattr(src, "slider_min", 0.0))
+                            nk.slider_max = float(getattr(src, "slider_max", 1.0))
+                    except Exception:
+                        pass
+
+                    for k in iter_keyblocks(obj):
+                        try: k.value = 0.0
+                        except Exception: pass
+
+                    changed_L = _sko_split_keyblock_half(
+                        obj, k_left,
+                        axis=self.split_axis,
+                        eps=max(0.0, self.split_eps),
+                        keep_side='LEFT',
+                        use_median_plane=self.use_median_plane
+                    )
+                    changed_R = _sko_split_keyblock_half(
+                        obj, k_right,
+                        axis=self.split_axis,
+                        eps=max(0.0, self.split_eps),
+                        keep_side='RIGHT',
+                        use_median_plane=self.use_median_plane
+                    )
+
+                    if changed_L == 0 or changed_R == 0:
+                        self.report(
+                            {'WARNING'},
+                            f"Split '{src.name}' affected L:{changed_L} / R:{changed_R} vertices. "
+                            f"Check axis/threshold or the model’s symmetry vs {self.split_axis}=0."
+                        )
+
+                    it = ensure_item_by_name(k_left.name,  create=True);  setattr(it, "selected", True)  if it else None
+                    it = ensure_item_by_name(k_right.name, create=True);  setattr(it, "selected", True) if it else None
+
+                    created += 2
+
+                    if not self.keep_original:
+                        try:
+                            idx = list(obj.data.shape_keys.key_blocks).index(src)
+                            obj.active_shape_key_index = idx
+                            bpy.ops.object.shape_key_remove(all=False)
+                        except Exception:
+                            self.report({'WARNING'}, f"Could not remove original key '{src.name}'.")
+
+                self.report({'INFO'}, f"Split {len(targets)} key(s) → created {created}.")
+                return {'FINISHED'}
+
+            finally:
+                sk = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+                if sk:
+                    for kb in sk:
+                        try:
+                            kb.value = float(values_cache.get(kb.name, 0.0))
+                        except Exception:
+                            pass
+                try:
+                    bpy.context.view_layer.update()
+                    for win in bpy.context.window_manager.windows:
+                        for area in win.screen.areas:
+                            if area.type in {'PROPERTIES', 'VIEW_3D'}:
+                                area.tag_redraw()
+                except Exception:
+                    pass
 
         # MIX_SELECTED
         ks = list(iter_keyblocks(obj))
@@ -966,61 +1304,89 @@ class SKO_OT_ShapeKeyAdd(Operator):
         self.key_name = ""
         return {'FINISHED'}
 
-class SKO_OT_ShapeKeyRemoveSelected(Operator):
-    bl_idname = "shapekey_organizer.shape_key_remove_selected"
-    bl_label = "Delete Selected"
-    bl_description = "Delete all selected shapekeys (Basis is ignored)"
+class SKO_OT_ShapeKeyDelete(bpy.types.Operator):
+    bl_idname = "shapekey_organizer.shape_key_delete"
+    bl_label = "Delete Shapekeys"
+    bl_description = "Delete selected shapekeys; if none are selected, delete the active shapekey"
     bl_options = {'REGISTER', 'UNDO'}
 
-    _delete_count: IntProperty(default=0, options={'SKIP_SAVE'})
+    _target_names: list[str] = None
+    _used_fallback: bool = False
 
-    def _gather_selection(self, context):
-        obj = active_obj_mesh(context)
-        if not obj:
-            return obj, []
-        ks = list(iter_keyblocks(obj)) or []
-        to_remove = [i for i, k in enumerate(ks) if not is_basis_key(obj, k) and get_sel(k)]
-        return obj, to_remove
+    def _gather_targets(self, context):
+        """Build target list and detect if we fell back to the active key."""
+        obj = context.object
+        if not obj or obj.type != 'MESH':
+            return [], False
+
+        pool = filtered_keys(context, obj)
+        any_selected = any(get_sel(k) and not is_basis_key(obj, k) for k in pool)
+
+        targets = get_target_keys(context,
+                                  require_selected=True,
+                                  visible_only=True,
+                                  fallback_to_active=True,
+                                  exclude_basis=True
+        )
+        names = [k.name for k in targets]
+        used_fallback = (not any_selected) and (len(names) == 1)
+
+        return names, used_fallback
 
     def invoke(self, context, event):
-        obj, to_remove = self._gather_selection(context)
-        if not obj:
-            self.report({'WARNING'}, "No mesh object selected.")
-            return {'CANCELLED'}
-        if not to_remove:
-            self.report({'INFO'}, "No shapekeys selected to delete.")
+        names, used_fallback = self._gather_targets(context)
+        if not names:
+            self.report({'INFO'}, "No shapekeys to delete.")
             return {'CANCELLED'}
 
-        self._delete_count = len(to_remove)
-        return context.window_manager.invoke_props_dialog(self, width=240)
+        self._target_names = names
+        self._used_fallback = used_fallback
+        return context.window_manager.invoke_props_dialog(self, width=360)
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text=f"Delete {self._delete_count} shapekey(s)?")
+        names = self._target_names or []
+
+        if self._used_fallback and len(names) == 1:
+            layout.label(text="Delete active shapekey?", icon='INFO')
+            layout.label(text=names[0], icon='SHAPEKEY_DATA')
+        else:
+            layout.label(text=f"Delete {len(names)} shapekey(s)?", icon='INFO')
+            for n in names[:6]:
+                layout.label(text=n, icon='DOT')
+            if len(names) > 6:
+                layout.label(text="…")
 
     def execute(self, context):
-        obj, to_remove = self._gather_selection(context)
-        if not obj or not to_remove:
+        obj = context.object
+        sk = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+        if not obj or not sk:
             return {'CANCELLED'}
 
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        except Exception:
-            pass
+        names = self._target_names
+        if not names:
+            names, _ = self._gather_targets(context)
+            if not names:
+                self.report({'INFO'}, "No shapekeys to delete.")
+                return {'CANCELLED'}
 
-        removed = 0
-        for i in sorted(to_remove, reverse=True):
-            obj.active_shape_key_index = i
+        indices = []
+        for n in names:
+            kb = sk.get(n)
+            if kb:
+                idx = list(sk).index(kb)
+                if idx > 0:
+                    indices.append(idx)
+
+        indices.sort(reverse=True)
+        for idx in indices:
+            obj.active_shape_key_index = idx
             try:
                 bpy.ops.object.shape_key_remove(all=False)
-                removed += 1
             except Exception:
                 pass
 
-        for k in iter_keyblocks(obj):
-            ensure_item_by_name(k.name, create=True)
-
-        self.report({'INFO'}, f"Deleted {removed} shapekey(s).")
+        self.report({'INFO'}, f"Deleted {len(indices)} shapekey(s).")
         return {'FINISHED'}
 
 
@@ -1155,12 +1521,45 @@ class SKO_OT_AssignGroup(Operator):
         if not obj:
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
-        count = 0
-        for k in iter_keyblocks(obj):
-            if get_sel(k):
-                set_group(k, self.group)
-                count += 1
-        self.report({'INFO'}, f"Assigned group '{self.group}' to {count} keys.")
+
+        props = context.scene.shapekey_organizer
+
+        gname = (self.group or "").strip() or (props.group_search or "").strip()
+        if not gname:
+            self.report({'WARNING'}, "Enter a group name first.")
+            return {'CANCELLED'}
+
+        all_keys = list(iter_keyblocks(obj))
+        selected_targets = [k for k in all_keys if get_sel(k) and not is_basis_key(obj, k)]
+
+        if not selected_targets:
+            ak = getattr(obj, "active_shape_key", None)
+            if ak and not is_basis_key(obj, ak):
+                targets = [ak]
+            else:
+                targets = []
+        else:
+            targets = selected_targets
+
+        if not targets:
+            self.report({'INFO'}, "No shapekeys to assign (Basis is ignored).")
+            return {'CANCELLED'}
+
+        for k in targets:
+            set_group(k, gname)
+
+        ensure_group(context, gname)
+
+        try:
+            bpy.context.view_layer.update()
+            for win in bpy.context.window_manager.windows:
+                for area in win.screen.areas:
+                    if area.type in {'PROPERTIES', 'VIEW_3D'}:
+                        area.tag_redraw()
+        except Exception:
+            pass
+
+        self.report({'INFO'}, f"Assigned group '{gname}' to {len(targets)} key(s).")
         return {'FINISHED'}
 
 
@@ -1195,21 +1594,33 @@ class SKO_OT_PrefixSuffix(Operator):
         if not obj:
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
+
         props = context.scene.shapekey_organizer
         pre, suf = props.prefix, props.suffix
         if not pre and not suf:
             self.report({'WARNING'}, "Nothing to add (enter a prefix and/or suffix).")
             return {'CANCELLED'}
+
+        targets = get_target_keys(context,
+                                  require_selected=props.affect_only_selected,
+                                  visible_only=True,
+                                  fallback_to_active=True,
+                                  exclude_basis=True
+        )
+        if not targets:
+            self.report({'INFO'}, "No shapekeys to rename.")
+            return {'CANCELLED'}
+
         count = 0
-        for k in iter_keyblocks(obj):
-            if props.affect_only_selected and not get_sel(k):
-                continue
+        for k in targets:
             it = ensure_item_by_name(k.name, create=True)
             new_name = f"{pre}{k.name}{suf}"
             k.name = new_name
-            it.key_name = new_name
+            if it:
+                it.key_name = new_name
             count += 1
-        self.report({'INFO'}, f"Renamed {count} keys.")
+
+        self.report({'INFO'}, f"Renamed {count} key(s).")
         return {'FINISHED'}
 
 
@@ -1376,13 +1787,18 @@ class SKO_OT_MoveSelected(Operator):
         if not obj:
             self.report({'WARNING'}, "Select a mesh object with shapekeys.")
             return {'CANCELLED'}
-        ks = iter_keyblocks(obj)
-        if not ks:
+        targets = get_target_keys(context,
+                                  require_selected=True,
+                                  visible_only=True,
+                                  fallback_to_active=True,
+                                  exclude_basis=True)
+        if not targets:
+            self.report({'INFO'}, "No keys to move.")
             return {'CANCELLED'}
-        idxs = [i for i, k in enumerate(ks) if get_sel(k)]
-        if not idxs:
-            self.report({'INFO'}, "No keys selected.")
-            return {'CANCELLED'}
+
+        ks = list(iter_keyblocks(obj))
+        name_to_idx = {k.name: i for i, k in enumerate(ks)}
+        idxs = [name_to_idx[k.name] for k in targets if k.name in name_to_idx]
 
         if self.direction in {'TOP', 'UP'}:
             order = sorted(idxs)
@@ -1463,8 +1879,11 @@ class SKO_OT_SetSliderRange(Operator):
                 min_v = max(0.0, min_v - half)
                 max_v = min(1.0, max_v + half)
 
-        visible = filtered_keys(context, obj)
-        targets = [k for k in visible if get_sel(k)] if props.affect_only_selected else list(visible)
+        targets = get_target_keys(context,
+                                  require_selected=props.affect_only_selected,
+                                  visible_only=True,
+                                  fallback_to_active=True,
+                                  exclude_basis=True)
         if not targets:
             self.report({'INFO'}, "No visible shapekeys to update.")
             return {'CANCELLED'}
@@ -1501,8 +1920,11 @@ class SKO_OT_ResetValues(Operator):
             return {'CANCELLED'}
         props = context.scene.shapekey_organizer
 
-        visible = filtered_keys(context, obj)
-        targets = [k for k in visible if get_sel(k)] if props.affect_only_selected else list(visible)
+        targets = get_target_keys(context,
+                                  require_selected=props.affect_only_selected,
+                                  visible_only=True,
+                                  fallback_to_active=True,
+                                  exclude_basis=True)
         if not targets:
             self.report({'INFO'}, "No visible shapekeys to reset.")
             return {'CANCELLED'}
@@ -1551,36 +1973,55 @@ class SKO_OT_GroupAdd(Operator):
     )
     bl_options = {'REGISTER', 'UNDO'}
 
+    group: StringProperty(
+        name="Group",
+        description="Group name to create/assign",
+        default=""
+    )
+
     def execute(self, context):
         scn = context.scene
         props = scn.shapekey_organizer
-        name = props.group_search.strip()
+
+        name = (self.group or props.group_search or "").strip()
         if not name:
             self.report({'WARNING'}, "Enter a group name to add.")
             return {'CANCELLED'}
 
         groups = scn.sko_groups
         existed = any(g.name == name for g in groups)
-        ensure_group(context, name)
 
+        ensure_group(context, name)
         for i, g in enumerate(groups):
             if g.name == name:
                 scn.sko_groups_index = i
                 break
+        props.group_search = name
 
-        obj = active_obj_mesh(context)
         assigned = 0
+        obj = active_obj_mesh(context)
         if obj:
-            for k in iter_keyblocks(obj):
-                if is_basis_key(obj, k):
-                    continue
-                if get_sel(k):
-                    set_group(k, name)
-                    assigned += 1
+            sk = getattr(getattr(obj.data, 'shape_keys', None), 'key_blocks', None)
+            all_keys = list(sk) if sk else []
+    
+            selected = [k for k in all_keys if get_sel(k) and not is_basis_key(obj, k)]
+            if selected:
+                targets = selected
+            else:
+                idx = getattr(obj, "active_shape_key_index", -1)
+                ak = sk[idx] if (sk and 0 <= idx < len(sk)) else None
+                targets = [ak] if (ak and not is_basis_key(obj, ak)) else []
+    
+            for k in targets:
+                set_group(k, name)
+                assigned += 1
 
-        for area in context.screen.areas:
-            if area.type == 'PROPERTIES':
-                area.tag_redraw()
+        try:
+            for area in context.screen.areas:
+                if area.type == 'PROPERTIES':
+                    area.tag_redraw()
+        except Exception:
+            pass
 
         if existed:
             self.report({'INFO'}, f"Selected existing group '{name}'. Assigned to {assigned} keys.")
@@ -1745,12 +2186,12 @@ class SKO_PT_Main(Panel):
         list_row.template_list("SKO_UL_shapekeys", "", obj.data.shape_keys, "key_blocks", obj, "active_shape_key_index", rows=10)
         row = box.row(align=True)
         row.operator("shapekey_organizer.shape_key_add", text="Create…", icon='ADD')
-        row.operator("shapekey_organizer.shape_key_remove_selected", text="Delete Selected", icon='TRASH')
+        row.operator("shapekey_organizer.shape_key_delete", text="Delete", icon='TRASH')
         controls = box.row(align=True)
-        controls.operator("shapekey_organizer.select_all")
-        controls.operator("shapekey_organizer.select_none")
-        controls.operator("shapekey_organizer.select_invert")
-        controls.operator("shapekey_organizer.sync_state")
+        controls.operator("shapekey_organizer.select_all", icon='CHECKBOX_HLT')
+        controls.operator("shapekey_organizer.select_none", icon='CHECKBOX_DEHLT')
+        controls.operator("shapekey_organizer.select_invert", icon='ARROW_LEFTRIGHT')
+        controls.operator("shapekey_organizer.sync_state", icon='FILE_REFRESH')
         box.label(text="Tip: Shift-click a checkbox to select a range.")
 
         layout.separator()
@@ -1760,12 +2201,12 @@ class SKO_PT_Main(Panel):
         sm.label(text="Ordering")
         row = sm.row(align=True)
         row.prop(props, 'sort_mode', text="")
-        row.operator("shapekey_organizer.sort")
+        row.operator("shapekey_organizer.sort", icon='SORTALPHA')
         row = sm.row(align=True)
-        row.operator("shapekey_organizer.move_selected", text="Top").direction = 'TOP'
-        row.operator("shapekey_organizer.move_selected", text="Up").direction = 'UP'
-        row.operator("shapekey_organizer.move_selected", text="Down").direction = 'DOWN'
-        row.operator("shapekey_organizer.move_selected", text="Bottom").direction = 'BOTTOM'
+        row.operator("shapekey_organizer.move_selected", text="Top", icon="TRIA_UP_BAR").direction = 'TOP'
+        row.operator("shapekey_organizer.move_selected", text="Up", icon="TRIA_UP").direction = 'UP'
+        row.operator("shapekey_organizer.move_selected", text="Down", icon="TRIA_DOWN").direction = 'DOWN'
+        row.operator("shapekey_organizer.move_selected", text="Bottom", icon="TRIA_DOWN_BAR").direction = 'BOTTOM'
 
         layout.separator()
 
@@ -1778,20 +2219,20 @@ class SKO_PT_Main(Panel):
         if props.show_groups:
             r = grp.row(align=True)
             r.prop(props, 'group_search', text="Group")
-            r.operator("shapekey_organizer.group_add", text="Add")
+            r.operator("shapekey_organizer.group_add", text="Add", icon='ADD')
 
             rr = grp.row(align=True)
             rr.template_list("SKO_UL_groups", "", context.scene, "sko_groups", context.scene, "sko_groups_index", rows=5)
             col = rr.column(align=True)
-            col.operator("shapekey_organizer.group_move", text="Up").direction = 'UP'
-            col.operator("shapekey_organizer.group_move", text="Down").direction = 'DOWN'
+            col.operator("shapekey_organizer.group_move", text="Up", icon="TRIA_UP").direction = 'UP'
+            col.operator("shapekey_organizer.group_move", text="Down", icon="TRIA_DOWN").direction = 'DOWN'
             col.separator()
-            col.operator("shapekey_organizer.group_remove", text="Remove")
+            col.operator("shapekey_organizer.group_remove", text="Remove", icon='REMOVE')
 
             r2 = grp.row(align=True)
-            r2.operator("shapekey_organizer.group_select_keys", text="Select Keys")
-            r2.operator("shapekey_organizer.group_filter_apply", text="Filter")
-            r2.operator("shapekey_organizer.group_filter_clear", text="Clear Filter")
+            r2.operator("shapekey_organizer.group_select_keys", text="Select Keys", icon='RESTRICT_SELECT_OFF')
+            r2.operator("shapekey_organizer.group_filter_apply", text="Filter", icon='FILTER')
+            r2.operator("shapekey_organizer.group_filter_clear", text="Clear Filter", icon='X')
             grp.label(text=f"Active filter: '{props.filter_group or 'None'}'")
 
         layout.separator()
@@ -1862,7 +2303,7 @@ classes = (
     SKO_OT_ToggleShowOnly,
     SKO_OT_KeyActivateOrRename,
     SKO_OT_ShapeKeyAdd,
-    SKO_OT_ShapeKeyRemoveSelected,
+    SKO_OT_ShapeKeyDelete,
     SKO_OT_CheckUpdates,
     SKO_OT_ToggleSelect,
     SKO_OT_SelectAll,
