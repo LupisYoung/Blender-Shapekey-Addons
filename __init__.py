@@ -160,7 +160,7 @@ def _elide(text: str, max_len: int = 14) -> str:
 def _sko_split_keyblock_half(obj, src_key, axis='X', eps=1e-4, keep_side='LEFT', use_median_plane=False):
     """
     Zero out the opposite half of src_key (relative to Basis), by copying Basis coords.
-    keep_side: 'LEFT' or 'RIGHT' (negative vs positive side along the chosen axis).
+    keep_side: 'LEFT' or 'RIGHT' (negative vs positive side along the X axis).
     If use_median_plane is True, split around the median coordinate of Basis on that axis.
     """
     sk = obj.data.shape_keys
@@ -794,13 +794,6 @@ class SKO_OT_ShapeKeyAdd(Operator):
     )
 
     # Only used when mode == SPLIT
-    split_axis: bpy.props.EnumProperty(
-        name="Axis",
-        description="Axis used to split the shapekey",
-        items=[('X','X','Split across X=0'), ('Y','Y','Split across Y=0'), ('Z','Z','Split across Z=0')],
-        default='X'
-    )
-
     split_eps: bpy.props.FloatProperty(
         name="Threshold",
         description="Vertices within this distance of the split plane are kept (prevents tiny holes)",
@@ -827,7 +820,7 @@ class SKO_OT_ShapeKeyAdd(Operator):
 
     use_median_plane: bpy.props.BoolProperty(
         name="Use Median Plane",
-        description="Split relative to the mesh’s median on the chosen axis (robust if the model isn’t centered on 0)",
+        description="Split relative to the mesh’s median on the axis (robust if the model isn’t centered on 0)",
         default=False,
         options={'SKIP_SAVE'},
     )
@@ -870,8 +863,6 @@ class SKO_OT_ShapeKeyAdd(Operator):
             col.prop(self, "split_left_token", text="Left Suffix")
             col.prop(self, "split_right_token", text="Right Suffix")
 
-            row = layout.row(align=True)
-            row.prop(self, "split_axis", expand=True)
             row = layout.row(align=True)
             row.prop(self, "split_eps")
 
@@ -1192,14 +1183,14 @@ class SKO_OT_ShapeKeyAdd(Operator):
 
                     changed_L = _sko_split_keyblock_half(
                         obj, k_left,
-                        axis=self.split_axis,
+                        axis="X",
                         eps=max(0.0, self.split_eps),
                         keep_side='LEFT',
                         use_median_plane=self.use_median_plane
                     )
                     changed_R = _sko_split_keyblock_half(
                         obj, k_right,
-                        axis=self.split_axis,
+                        axis="X",
                         eps=max(0.0, self.split_eps),
                         keep_side='RIGHT',
                         use_median_plane=self.use_median_plane
@@ -1209,7 +1200,7 @@ class SKO_OT_ShapeKeyAdd(Operator):
                         self.report(
                             {'WARNING'},
                             f"Split '{src.name}' affected L:{changed_L} / R:{changed_R} vertices. "
-                            f"Check axis/threshold or the model’s symmetry vs {self.split_axis}=0."
+                            f"Check threshold or the model’s symmetry vs X=0."
                         )
 
                     it = ensure_item_by_name(k_left.name,  create=True);  setattr(it, "selected", True)  if it else None
