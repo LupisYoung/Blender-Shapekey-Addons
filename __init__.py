@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Shapekey Add-Ons",
     "author": "LupisYoung",
-    "version": (1, 4, 1),
+    "version": (1, 4, 2),
     "blender": (3, 6, 0),
     "location": "Object Data Properties > Shape Keys",
     "description": "Organize, search/filter, group-tag, batch-rename, sort, and bulk-edit shapekeys.",
@@ -1162,6 +1162,11 @@ class SKO_OT_ShapeKeyAdd(Operator):
                     bpy.ops.object.shape_key_add(from_mix=True)
                     k_left = obj.data.shape_keys.key_blocks[-1]
                     obj.active_shape_key_index = len(obj.data.shape_keys.key_blocks) - 1
+
+                    try:
+                        k_left.value = 0.0
+                    except Exception:
+                        pass
 
                     bpy.ops.object.shape_key_add(from_mix=True)
                     k_right = obj.data.shape_keys.key_blocks[-1]
